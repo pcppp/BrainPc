@@ -3,7 +3,7 @@ The Graph Neural Network from the `"How Powerful are Graph Neural Networks?"
 <https://arxiv.org/abs/1810.00826>`_ paper.
 """
 from typing import Callable, Optional
-
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch_geometric.nn as gnn
@@ -104,19 +104,36 @@ class DGINFeatExtractor(GNNBasic):
     """
     def __init__(self, config: Union[CommonArgs, Munch], **kwargs):
         super(DGINFeatExtractor, self).__init__(config)
+        print("config.dataset 的内容如下：")
+        for k, v in config.dataset.items():
+            print(f"{k}: {v}")
+        print("config.ood 的内容如下：")
+        for k, v in config.ood.items():
+            print(f"{k}: {v}")
+        print("启用CWN：",config.model.use_cwn)    
+        self.use_cwn = config.model.use_cwn == True
+        self.lin_0 = torch.nn.Linear(100, 1)
+        self.lin_1 = torch.nn.Linear(1, 1)
+        self.lin_2 = torch.nn.Linear(100, 1)
+        self.cwn_model = CWN(
+            in_channels_0=config.dataset.in_channels_0,              # 例如节点初始维度
+            in_channels_1=config.dataset.in_channels_1,              # 若无初始特征可设为0
+            in_channels_2=config.dataset.in_channels_2,              # 若无初始特征可设为0
+            hid_channels=config.model.dim_hidden,
+            n_layers=config.model.model_layer)
         num_layer = config.model.model_layer
         if config.dataset.dataset_type == 'mol':
             raise NotImplementedError
         else:
             self.encoder = GINEncoder(config, **kwargs)
             self.hp_encoder = HPGINEncoder(config, **kwargs)
-            self.mask_emb = nn.Parameter(torch.randn(config.model.dim_hidden, config.model.dim_hidden), requires_grad=True)
+            # self.mask_emb = nn.Parameter(torch.randn(config.model.dim_hidden, config.model.dim_hidden), requires_grad=True)
+            self.mask_emb = nn.Parameter(torch.randn(config.dataset.in_channels_0, config.dataset.in_channels_0), requires_grad=True)
             self.feat_dropout = nn.Dropout(config.ood.feature_dropout)
             # self.fuse = nn.Linear(2 * config.model.dim_hidden, config.model.dim_hidden)
             # self.fuse = nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
             self.edge_feat = False
             self.ent_loss = 0.0
-
         # self.diffusion = DenoiseModel(config.model.dim_hidden, config.model.dim_hidden)
 
     def forward(self, *args, **kwargs):
@@ -130,7 +147,8 @@ class DGINFeatExtractor(GNNBasic):
         Returns (Tensor):
             node feature representations
         """
-        x, edge_index, batch, batch_size = self.arguments_read(*args, **kwargs)
+        x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t= self.arguments_read(*args, **kwargs)
+        
         # x = self.feat_dropout(x)
         kwargs.pop('batch_size', 'not found')
         # generate a learnable mask
@@ -141,7 +159,59 @@ class DGINFeatExtractor(GNNBasic):
         mask = single_mask.repeat(bz, 1).view(bz * dim, dim)
         x = x * mask
         loss = 0.0
-        out_readout = self.encoder(x, edge_index, batch, batch_size, **kwargs)
+        gin_graph = self.encoder(x, edge_index, batch, batch_size, **kwargs)
+        kwargs_node = kwargs.copy()  # 复制原始 kwargs
+        kwargs_node['without_readout'] = True  # 设置为获取节点级特征
+        gin_node_features = self.encoder(x, edge_index, batch, batch_size,  **kwargs_node)
+        out_readout = gin_graph
+        # 🔧 将节点级特征按图分割
+        gin_node_list = []
+        start_idx = 0
+        for i in range(batch_size):
+            # 提取当前图的节点特征
+            num_nodes = 100
+            graph_nodes = gin_node_features[start_idx:start_idx + num_nodes]
+            gin_node_list.append(graph_nodes)
+            start_idx += num_nodes
+            
+            # print(f"图 {i}: 节点数 = {num_nodes}, 节点特征形状 = {graph_nodes.shape}")
+        if(self.use_cwn):
+            cwn0_list = []  
+            # 🔧 使用原始batch信息，避免信息损失
+            from torch_geometric.utils import to_dense_batch
+            for x0,x1,x2,adjacency1,incidence2,incidence1_t in zip(gin_node_list,x_1,x_2, adjacency_1, incidence_2, incidence_1_t):
+                # x0 = self.lin_0(x0)
+                # x1 = self.lin_1(x1) 
+                # x2 = self.lin_2(x2)
+                cwn_0, cwn_1, cwn_2 = self.cwn_model(x0, x1, x2, adjacency1, incidence2, incidence1_t)
+                cwn0_list.append(cwn_0)
+            from torch_scatter import scatter_mean
+            torch.nn.BCEWithLogitsLoss()
+            device = cwn0_list[0].device
+            lens = torch.tensor([t.size(0) for t in cwn0_list], device=device)  # (num_graphs,)
+            batch_index = torch.repeat_interleave(
+                torch.arange(len(cwn0_list), device=device), lens
+            )  # 形状 (sum V_i,)
+            cwn0_cat = torch.cat(cwn0_list, dim=0)    
+            # 🔧 使用 to_dense_batch 将节点特征按图分组
+            cwn_dense, cwn_mask = to_dense_batch(cwn0_cat, batch)
+            # cwn_dense: [batch_size, max_nodes, hidden_dim] = [64, 100, hidden_dim]
+            # cwn_mask: [batch_size, max_nodes] = [64, 100] - 指示哪些节点是真实的
+            graph_0 = scatter_mean(cwn0_cat, batch_index, dim=0)
+            if(kwargs.get('without_readout')):
+                cwn_graph = cwn0_cat
+            else :
+                cwn_graph = []
+                for i in range(batch_size):
+                    # 获取第 i 个图的真实节点特征
+                    real_nodes = cwn_dense[i][cwn_mask[i]]  # [num_real_nodes, hidden_dim]
+                    graph_feat = real_nodes.mean(dim=0, keepdim=True)  # [1, hidden_dim]
+                    cwn_graph.append(graph_feat)
+                cwn_graph = torch.cat(cwn_graph, dim=0)  # [64, hidden_dim]
+            if gin_graph.size(-1) != cwn_graph.size(-1):
+                raise RuntimeError(f"GIN与CWN隐藏维度不一致: {gin_graph.size(-1)} vs {cwn_graph.size(-1)}")
+            out_readout = cwn_graph
+
         if kwargs.get('without_readout'):
             self.ent_loss = self.entropy_loss(single_mask)
             post_diffusion = self.hp_encoder(out_readout, edge_index, batch, batch_size, **kwargs)
@@ -169,6 +239,95 @@ class DGINFeatExtractor(GNNBasic):
         entropy = (torch.distributions.Categorical(logits=x).entropy()).mean()
         assert not torch.isnan(entropy)
         return entropy
+
+
+
+from GOOD.utils.cw.topomodelx.nn.cell.cwn import CWN
+from torch_geometric.nn import global_mean_pool
+
+
+
+
+class NetWork(GNNBasic):
+    def __init__( 
+        self,
+        in_channels_0,
+        in_channels_1,
+        in_channels_2,
+        hid_channels=16,
+        num_classes=1,
+        n_layers=2,
+    ):
+        super().__init__()
+        self.base_model = CWN(
+            in_channels_0,
+            in_channels_1,
+            in_channels_2,
+            hid_channels=hid_channels,
+            n_layers=n_layers,
+        )
+        self.lin_0 = torch.nn.Linear(hid_channels, num_classes)
+        self.lin_1 = torch.nn.Linear(hid_channels, num_classes)
+        self.lin_2 = torch.nn.Linear(hid_channels, num_classes)
+
+    def forward(
+        self,
+        x_0,
+        x_1,
+        x_2,
+        adjacency_1,
+        incidence_2,
+        incidence_1_t,
+    ):
+        x_0, x_1, x_2 = self.base_model(
+            x_0, x_1, x_2, adjacency_1, incidence_2, incidence_1_t
+        )
+        x_0 = self.lin_0(x_0)
+        x_1 = self.lin_1(x_1)
+        x_2 = self.lin_2(x_2)
+
+        # Take the average of the 2D, 1D, and 0D cell features. If they are NaN, convert them to 0.
+        two_dimensional_cells_mean = torch.nanmean(x_2, dim=0)
+        two_dimensional_cells_mean[torch.isnan(two_dimensional_cells_mean)] = 0
+
+        one_dimensional_cells_mean = torch.nanmean(x_1, dim=0)
+        one_dimensional_cells_mean[torch.isnan(one_dimensional_cells_mean)] = 0
+
+        zero_dimensional_cells_mean = torch.nanmean(x_0, dim=0)
+        zero_dimensional_cells_mean[torch.isnan(zero_dimensional_cells_mean)] = 0
+
+        # Return the sum of the averages
+        return (
+            two_dimensional_cells_mean
+            + one_dimensional_cells_mean
+            + zero_dimensional_cells_mean
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class GINEncoder(BasicEncoder):

@@ -22,6 +22,7 @@ model:
   dim_hidden: 100
   dim_ffn: 100
   dropout_rate: 0.5
+  use_cwn: False # False / True
 dataset:
   dataloader_name: BaseDataLoader
   dataset_root: null

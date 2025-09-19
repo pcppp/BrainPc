@@ -62,6 +62,20 @@ class GNNBasic(torch.nn.Module):
         else:
             x, edge_index, batch = data.x, data.edge_index, data.batch
 
+            # 检查是否有拓扑特征，挂载默认值或报错
+            x_0 = getattr(data, 'x_0', None)
+            x_1 = getattr(data, 'x_1', None)
+            x_2 = getattr(data, 'x_2', None)
+            in_channels_0 = 100
+            in_channels_1 = 1
+            in_channels_2 = 100
+            # print('-----------------------@',in_channels_0)
+            # print(in_channels_1)
+            # print(in_channels_2)
+            adjacency_1 = getattr(data, 'adjacency', None)
+            incidence_2 = getattr(data, 'incidence_2', None)
+            incidence_1_t = getattr(data, 'incidence_1_t', None)
+
         if self.config.model.model_level != 'node':
             # --- Maybe batch size --- Reason: some method may filter graphs leading inconsistent of batch size
             batch_size: int = kwargs.get('batch_size') or (batch[-1].item() + 1)
@@ -73,7 +87,7 @@ class GNNBasic(torch.nn.Module):
             edge_attr = data.edge_attr
             return x, edge_index, edge_attr, batch, batch_size
 
-        return x, edge_index, batch, batch_size
+        return x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t
 
     def probs(self, *args, **kwargs):
         # nodes x classes

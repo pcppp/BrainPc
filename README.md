@@ -8,3 +8,5 @@ BrainOOD: Out-of-distribution Generalizable Brain Network Analysis"* published i
 ## Contact
 
 If you have any questions, please feel free to reach out at `jiaxing003@e.ntu.edu.sg`.
+
+goodtg --config_path GOOD_configs/GOODABIDE/site/concept/BrainOOD.yaml

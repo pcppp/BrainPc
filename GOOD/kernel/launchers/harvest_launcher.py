@@ -17,7 +17,7 @@ from GOOD.utils.args import args_parser
 from GOOD.utils.config_reader import load_config, args2config, merge_dicts
 from .basic_launcher import Launcher
 from typing import Literal
-from cilog import create_logger
+# from cilog import create_logger
 
 
 @register.launcher_register
@@ -27,7 +27,7 @@ class HarvestLauncher(Launcher):
         self.watch = False
         self.pick_reference = [-1]
         self.test_index = -2
-        self.logger = create_logger('Harvest', file='result_table.md', use_color=False)
+        # self.logger = create_logger('Harvest', file='result_table.md', use_color=False)
 
     def __call__(self, jobs_group, auto_args: AutoArgs):
         result_dict = self.harvest_all_fruits(jobs_group)

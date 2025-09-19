@@ -12,7 +12,8 @@ import torch
 from torch_geometric.data import InMemoryDataset, download_url
 from tqdm import tqdm
 
-from GOOD.utils.data import from_smiles
+from GOOD.utils.dataUtils import from_smiles
+
 
 
 class ZINC(InMemoryDataset):

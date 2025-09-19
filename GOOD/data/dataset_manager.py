@@ -34,7 +34,7 @@ def load_dataset(name: str, config: Union[CommonArgs, Munch], fold: int = 0) -> 
         A dataset object and new configs
             - config.dataset.dataset_type
             - config.model.model_level
-            - config.dataset.dim_node
+            - config.dataset.dim_node()
             - config.dataset.dim_edge
             - config.dataset.num_envs
             - config.dataset.num_classes
@@ -42,6 +42,7 @@ def load_dataset(name: str, config: Union[CommonArgs, Munch], fold: int = 0) -> 
     """
     try:
         reset_random_seed(config)
+
         dataset, meta_info = register.datasets[name].load(dataset_root=config.dataset.dataset_root,
                                                           domain=config.dataset.domain,
                                                           shift=config.dataset.shift_type,

@@ -17,7 +17,6 @@ from tqdm import tqdm
 from GOOD.ood_algorithms.algorithms.BaseOOD import BaseOODAlg
 from GOOD.utils.args import CommonArgs
 from GOOD.utils.evaluation import eval_data_preprocess, eval_score
-from GOOD.utils.logger import pbar_setting
 from GOOD.utils.register import register
 from GOOD.utils.train import nan2zero_get_mask
 
@@ -109,7 +108,6 @@ class Pipeline:
                 # Parameter for DANN
                 p = (index / len(self.loader['train']) + epoch) / self.config.train.max_epoch
                 self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
-
                 # train a batch
                 # train_stat = self.train_batch(data, pbar)
                 train_stat = self.train_batch(data, None)
@@ -144,8 +142,8 @@ class Pipeline:
                     print(f'#IN#Epoch {epoch}: Approximated ' + desc[:-1])
                 else:
                     print(f'#IN#Epoch {epoch}: Approximated average M/S Loss {mean_loss:.4f}/{spec_loss:.4f}')
-            else:
-                print(f'#IN#Epoch {epoch}: Approximated average training loss {mean_loss.cpu().item():.4f}')
+            # else:
+                # print(f'#IN#Epoch {epoch}: Approximated average training loss {mean_loss.cpu().item():.4f}')
 
             epoch_train_stat = self.evaluate('eval_train')
             id_val_stat = self.evaluate('id_val')
@@ -154,7 +152,7 @@ class Pipeline:
             test_stat = self.evaluate('test', True)
             print(f'#IN#Epoch {epoch}: Train acc {epoch_train_stat["score"]:.4f}, '
                   f'ID_val acc {id_val_stat["score"]:.4f}, '
-                  f'ID_test acc {id_test_stat["score"]:.4f}, '
+                  f'ID_test acc {id_test_stat["score"]:.4f},'
                   f'OOD_val acc {val_stat["score"]:.4f}, '
                   f'OOD_test acc {test_stat["score"]:.4f}')
             # print(f'#IN#Epoch {epoch}: Test precision {test_stat["precision"]:.4f}, '

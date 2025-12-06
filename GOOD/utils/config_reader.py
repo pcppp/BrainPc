@@ -163,10 +163,9 @@ def args2config(config: Union[CommonArgs, Munch], args: CommonArgs):
                 if value is not None:
                     config[key] = value
             else:
-                # warnings.warn(f'Argument {key} in the chosen config yaml file are not defined in command arguments, '
-                #               f'which will lead to incomplete code detection and the lack of argument temporary '
-                #               f'modification by adding command arguments.')
-                warnings.warn(f'Argument {key}  are not defined in command arguments')
+                warnings.warn(f'Argument {key} in the chosen config yaml file are not defined in command arguments, '
+                              f'which will lead to incomplete code detection and the lack of argument temporary '
+                              f'modification by adding command arguments.')
 
 
 def process_configs(config: Union[CommonArgs, Munch], fold: int):

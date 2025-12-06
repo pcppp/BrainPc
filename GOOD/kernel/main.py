@@ -220,8 +220,9 @@ def main():
     lambda1_list = [0.1]   # entropy_trade_off [0.1, 0.01, 0.001]   
     lambda2_list = [1.0]     # trade_off [1.0, 0.1, 0.01]
     lambda3_list = [1.0]      # diffusion_trade_off [1.0, 0.5, 0.1] 
-    epoch_list = [ 8 ,10 ,12, 16,20]
-    lr_list = [2e-3,4e-3,6e-3,8e-3,1e-2]
+    epoch_list = [100]
+    # lr_list = [2e-3,4e-3,6e-3,8e-3,1e-2]
+    lr_list = [6e-5]
     total = len(lambda1_list) * len(lambda2_list) * len(lambda3_list)*len(epoch_list)*len(lr_list)
    
     # XML
@@ -243,7 +244,7 @@ def main():
         config.ood.diffusion_trade_off = float(l3)  # λ3
         config.train.max_epoch = int(epoch)
         config.train.lr = float(lr)
-        print(f"\n=== Run with λ1={l1}, λ2={l2}, λ3={l3} ===")
+        print(f"\n=== Run with λ1={l1}, λ2={l2}, λ3={l3} epoch_list ={epoch} lr_list = {lr} === ")
         id_res, ood_res, mix_res = run_10fold_once(config)
 
         row_data = {

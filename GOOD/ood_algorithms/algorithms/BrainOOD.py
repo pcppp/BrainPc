@@ -82,19 +82,18 @@ class BrainOOD(BaseOODAlg):
             loss based on DIR algorithm
 
         """
-        att = self.att
-        eps = 1e-6
-        r = self.get_r(self.decay_interval, self.decay_r, config.train.epoch, final_r=self.final_r)
-        info_loss = (att * torch.log(att / r + eps) +
-                     (1 - att) * torch.log((1 - att) / (1 - r + eps) + eps)).mean()
-        # if self.decay_interval*((0.9-self.final_r)//self.decay_r+1) >= config.train.epoch and config.ood.ood_param > 0:
-        #     config.metric.id_best_stat['score'] = None
-        #     config.metric.best_stat['score'] = None
-        self.mean_loss = loss.mean()
-        self.spec_loss = config.ood.ood_param * info_loss + config.ood.trade_off * similarity_loss(self.model.causal_adj) + \
-                         config.ood.diffusion_trade_off * self.model.diffusion_loss + config.ood.entropy_trade_off * self.model.entropy_loss
+        # att = self.att
+        # eps = 1e-6
+        # r = self.get_r(self.decay_interval, self.decay_r, config.train.epoch, final_r=self.final_r)
+        # info_loss = (att * torch.log(att / r + eps) +
+        #              (1 - att) * torch.log((1 - att) / (1 - r + eps) + eps)).mean()
 
-        loss = self.mean_loss + self.spec_loss
+        self.mean_loss = loss.mean()
+        # self.spec_loss = config.ood.ood_param * info_loss + config.ood.trade_off * similarity_loss(self.model.causal_adj) + \
+        #                  config.ood.diffusion_trade_off * self.model.diffusion_loss + config.ood.entropy_trade_off * self.model.entropy_loss
+
+        # loss = self.mean_loss + self.spec_loss
+        loss = self.mean_loss  # 消融损失
         return loss
 
     def get_r(self, decay_interval, decay_r, current_epoch, init_r=0.9, final_r=0.5):

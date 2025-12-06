@@ -58,7 +58,7 @@ class GATFeatExtractor(GNNBasic):
         self.encoder = GATEncoder(config)
         self.edge_feat = False
 
-    def forward(self, *args, **kwargs):
+    def forward(self, x=None, *args, **kwargs):
         r"""
         GAT feature extractor using the :class:`~GATEncoder`.
 
@@ -69,8 +69,10 @@ class GATFeatExtractor(GNNBasic):
         Returns (Tensor):
             node feature representations
         """
-        x, edge_index, edge_weight, batch = self.arguments_read(*args, **kwargs)
-        out_readout = self.encoder(x, edge_index, edge_weight, batch)
+        x_f, edge_index, edge_weight, batch ,batch_size= self.arguments_read(*args, **kwargs)
+        if(x==None):
+            x = x_f
+        out_readout = self.encoder(x, edge_index, edge_weight, batch, batch_size)
         return out_readout
 
 
@@ -142,15 +144,15 @@ class GATEncoder(BasicEncoder):
         num_layer = config.model.model_layer
         heads = 1 #config.model.attention_heads
 
-        self.conv1 = GATConv(config.dataset.dim_node, config.model.dim_hidden, heads=heads)
+        self.conv1 = gnn.GATConv(config.dataset.dim_node, config.model.dim_hidden, heads=heads)
         self.convs = nn.ModuleList(
             [
-                GATConv(config.model.dim_hidden * heads, config.model.dim_hidden, heads=heads)
+                gnn.GATConv(config.model.dim_hidden * heads, config.model.dim_hidden, heads=heads)
                 for _ in range(num_layer - 1)
             ]
         )
 
-    def forward(self, x, edge_index, batch, batch_size, **kwargs):
+    def forward(self, x, edge_index,edge_weight, batch, batch_size, **kwargs):
         r"""
         The GAT encoder.
 
@@ -162,10 +164,10 @@ class GATEncoder(BasicEncoder):
         Returns (Tensor):
             node feature representations
         """
-        post_conv = self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index))))
+        post_conv = self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index,edge_weight))))
         for i, (conv, batch_norm, relu, dropout) in enumerate(
                 zip(self.convs, self.batch_norms, self.relus, self.dropouts)):
-            post_conv = batch_norm(conv(post_conv, edge_index))
+            post_conv = batch_norm(conv(post_conv, edge_index,edge_weight))
             if i < len(self.convs) - 1:
                 post_conv = relu(post_conv)
             post_conv = dropout(post_conv)
@@ -173,7 +175,7 @@ class GATEncoder(BasicEncoder):
         if kwargs.get('without_readout'):
             return post_conv
         out_readout = self.readout(post_conv, batch, batch_size)
-        return out_readout
+        return out_readout,None
 
 
 class GATConv(gnn.GATConv):
@@ -200,11 +202,7 @@ class GATConv(gnn.GATConv):
         Returns (Tensor):
             node feature representations
         """
-        x = self.lin_l(x)
-        out = self.propagate(edge_index, x=x, edge_weight=edge_weight)
-        if self.bias is not None:
-            out += self.bias
-        return out
+        return super().forward(x, edge_index, edge_attr=edge_weight)
 
 
 class HPGATEncoder(BasicEncoder):

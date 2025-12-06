@@ -128,33 +128,7 @@ class GOODABIDE(InMemoryDataset):
 
     def process(self):
         print('#IN#Using default OOD splits')
-        # dataset = MoleculeNet(root=self.root, name=self.mol_name)
-        # print('Load data done!')
 
-        # data_list = []
-        # for i, data in enumerate(dataset):
-        #     data.idx = i
-        #     data_list.append(data)
-        # self.num_data = data_list.__len__()
-        # print('Extract data done!')
-        # print('#IN#Loading default OOD splits...')
-        # all_datasets = self.load()
-        # print('#IN#Loading default OOD splits done!')
-
-        # no_shift_list = self.get_no_shift_list(deepcopy(data_list))
-        # print('#IN#No shift dataset done!')
-        # sorted_data_list, sorted_domain_split_data_list = self.get_domain_sorted_list(data_list, domain=self.domain)
-        # covariate_shift_list = self.get_covariate_shift_list(deepcopy(sorted_data_list))
-        # print()
-        # print('#IN#Covariate shift dataset done!')
-        # concept_shift_list = self.get_concept_shift_list(deepcopy(sorted_domain_split_data_list))
-        # print()
-        # print('#IN#Concept shift dataset done!')
-
-        # all_data_list = no_shift_list + covariate_shift_list + concept_shift_list
-        # for i, final_data_list in enumerate(all_data_list):
-        #     data, slices = self.collate(final_data_list)
-        #     torch.save((data, slices), self.processed_paths[i])
 
     @staticmethod
     def load(dataset_root: str, domain: str="site", shift: str = 'no_shift', generate: bool = False, fold: int = 0):
@@ -184,65 +158,23 @@ class GOODABIDE(InMemoryDataset):
         with open('./GOOD/data/good_datasets/abide_full_ood_schaefer100/meta.json', 'r') as f:
             meta_json = json.load(f)
         
-        bin_dir = './GOOD/data/bin_dataset/'
-        complexes_dir = './GOOD/data/complexes_dataset/complexes.pt'
-        # ------------ complexes dataset ------------
-        # 确保文件处理顺序一致
-        filenames = sorted([f for f in os.listdir(bin_dir) if f.endswith('.bin')])
-        
-        all_graphs = []
-        all_labels = []
-        complexes = torch.load(complexes_dir)
-        
-        global_graph_idx = 0  # 🔧 添加全局索引计数器
-        
-        for filename in filenames:  # 🔧 使用排序后的文件名
-            path = os.path.join(bin_dir, filename)
-            graphs, label_dict = load_graphs(path)
-
-            for i in range(len(graphs)):
-                # 🔧 使用全局索引而不是局部索引
-                if global_graph_idx < len(complexes):
-                    graphs[i].complexes = complexes[global_graph_idx]
-                else:
-                    print(f"Warning: complex索引 {global_graph_idx} 超出范围 {len(complexes)}")
-                    # 可以选择跳过或使用默认值
-                    break
-                global_graph_idx += 1
-            
-            all_graphs.extend(graphs)
-            all_labels.append(label_dict['glabel'])
-         
-        # 🔧 安全的标签拼接
-        try:
-            all_labels = torch.cat(all_labels, dim=0)
-        except RuntimeError as e:
-            for i, labels in enumerate(all_labels):
-                print(f"  文件{i}: {labels.shape}")
-            raise
-        
-        # 🔧 验证数据一致性
-        if len(all_graphs) != len(all_labels):
-            raise ValueError(f"图数量 {len(all_graphs)} 与标签数量 {len(all_labels)} 不匹配")
-        
-        print(f"成功加载 {len(all_graphs)} 个图和 {len(all_labels)} 个标签")
-        G_dataset = all_graphs
-        Labels = {'glabel': all_labels}
-
+       
+        # G_dataset, Labels = load_graphs('./GOOD/data/bin_gb_dataset/abide_gb.bin')
+        G_dataset, Labels = load_graphs('./GOOD/data/bin_time_dataset/abide.bin')
         # G_dataset, Labels = load_graphs('./GOOD/data/bin_dataset/abide.bin')
 
 
-        # error_case = []
-        # min_feat_dim = G_dataset[0].ndata['N_features'].shape[-1]
-        # # 稀疏化
-        # for i in range(len(G_dataset)):
-        #     if len(((G_dataset[i].ndata['N_features'] != 0).sum(dim=-1) == 0).nonzero()) > 0:
-        #         error_case.append(i)
-        #     if G_dataset[i].ndata['N_features'].shape[-1] < min_feat_dim:
-        #         min_feat_dim = G_dataset[i].ndata['N_features'].shape[-1]
-        # print(error_case)
-        # # G_dataset = [n for i, n in enumerate(G_dataset) if i not in error_case]
+        error_case = []
+        min_feat_dim = G_dataset[0].ndata['N_features'].shape[-1]
+        for i in range(len(G_dataset)):
+            if len(((G_dataset[i].ndata['N_features'] != 0).sum(dim=-1) == 0).nonzero()) > 0:
+                error_case.append(i)
+            if G_dataset[i].ndata['N_features'].shape[-1] < min_feat_dim:
+                min_feat_dim = G_dataset[i].ndata['N_features'].shape[-1]
+        print(error_case)
+        # G_dataset = [n for i, n in enumerate(G_dataset) if i not in error_case]
 
+        # 稀疏化
         # for i in tqdm(range(len(G_dataset))):
             
         #     # if edge_ratio:
@@ -258,7 +190,17 @@ class GOODABIDE(InMemoryDataset):
         #         # G_dataset[i].ndata['feat'] = torch.from_numpy(np.corrcoef(G_dataset[i].ndata['N_features'].numpy())).clone()
         #     else:
         #         raise NotImplementedError
-
+        
+        # 不重复进行稀疏化
+        for i in tqdm(range(len(G_dataset))):
+            # 边特征：为后续使用创建别名
+            G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
+            
+            # 节点特征：直接使用预处理时已经变换好的特征
+            if meta_info.node_feat_transform == 'pearson':
+                G_dataset[i].ndata['feat'] = G_dataset[i].ndata['N_features'].clone()
+            else:
+                raise NotImplementedError
 
         all_idx = get_all_split_idx(meta_info.name)
         train_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['train'][fold]]
@@ -337,25 +279,28 @@ def get_all_split_idx(name):
 
 def dgl_to_pyg(graph, y, domain):
     # cell --complexes
-    x = graph.ndata['N_features'].float()
-    edge_attr = graph.edata['feat'].float()
-    edge_index = torch.stack(graph.edges()).contiguous()
-    yy = torch.zeros(1, 2)
-    yy[0][y] = 1
-
-    return complex_to_pyg_data(complex = graph.complexes,x=x ,label=yy, domain=domain,edge_index=edge_index,edge_attr=edge_attr)
-    # origin 
-    # x = graph.ndata['feat']
+    # x = graph.ndata['N_features'].float()
+    
+    # edge_attr = graph.edata['feat'].float()
     # edge_index = torch.stack(graph.edges()).contiguous()
-    # yy = torch.zeros(1,2)
+    # yy = torch.zeros(1, 2)
     # yy[0][y] = 1
-    # # Create a PyG Data object
-    # data = Data(x=x.float(), edge_index=edge_index, y=yy,domain=domain)
-    # data.env_id = domain
-    # # print(data.edge_index.size())
-    # return data
-def complex_to_pyg_data(complex, x,label=None ,domain=None,edge_index=None,edge_attr=None):
+
+    # return complex_to_pyg_data(graph = graph,x=x ,label=yy, domain=domain,edge_index=edge_index,edge_attr=edge_attr)
+    # origin 
+    x = graph.ndata['feat']
+    edge_index = torch.stack(graph.edges()).contiguous()
+    edge_weight= graph.edata['feat'].float() 
+    yy = torch.zeros(1,2)
+    yy[0][y] = 1
+    # Create a PyG Data object
+    data = Data(x=x.float(), edge_index=edge_index,edge_weight = edge_weight ,y=yy,domain=domain)
+    data.env_id = domain
+    # print(data.edge_index.size())
+    return data
+def complex_to_pyg_data(graph, x,label=None ,domain=None,edge_index=None,edge_attr=None):
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    complex = graph.complexes
     coch0 = x
     coch1 = complex.cochains[1].x
     coch2 = complex.cochains[2].x
@@ -387,6 +332,8 @@ def complex_to_pyg_data(complex, x,label=None ,domain=None,edge_index=None,edge_
 
     # 构建 PyG Data 对象，三种特征分开挂载
     data = Data(x=x,edge_index=edge_index, y=label)
+    if 'ball_id' in graph.ndata:
+        data.ball_id = graph.ndata['ball_id'].long()   # [num_nodes]
     data.env_id = domain
 
     data.x_0 = coch0

@@ -65,7 +65,7 @@ class Pipeline:
         data, targets, mask, node_norm = self.ood_algorithm.input_preprocess(data, targets, mask, node_norm,
                                                                              self.model.training,
                                                                              self.config)
-        edge_weight = data.get('edge_norm') if self.config.model.model_level == 'node' else None
+        edge_weight = data.get('edge_weight') if hasattr(data, 'edge_weight') else data.get('edge_norm')
 
         model_output = self.model(data=data, edge_weight=edge_weight, ood_algorithm=self.ood_algorithm)
         raw_pred = self.ood_algorithm.output_postprocess(model_output)
@@ -333,12 +333,14 @@ class Pipeline:
 
                 print(
                     f'#IN#ChartInfo {ckpt["test_score"]:.4f} {ckpt["val_score"]:.4f}', end='')
-            if load_param:
-                if self.config.ood.ood_alg != 'EERM':
-                    self.model.load_state_dict(ckpt['state_dict'])
-                else:
-                    self.model.gnn.load_state_dict(ckpt['state_dict'])
+            # if load_param:
+            #     if self.config.ood.ood_alg != 'EERM':
+            #         self.model.load_state_dict(ckpt['state_dict'])
+            #     else:
+            #         self.model.gnn.load_state_dict(ckpt['state_dict'])
             # return ckpt["test_score"], ckpt["test_loss"]
+            if load_param:
+                self.model.load_state_dict(ckpt['state_dict'])
             return id_ckpt, ckpt
 
     def save_epoch(self, epoch: int, train_stat: dir, id_val_stat: dir, id_test_stat: dir, val_stat: dir,
@@ -359,7 +361,8 @@ class Pipeline:
             None
 
         """
-        state_dict = self.model.state_dict() if config.ood.ood_alg != 'EERM' else self.model.gnn.state_dict()
+        state_dict = self.model.state_dict() 
+        # state_dict = self.model.state_dict() if config.ood.ood_alg != 'EERM' else self.model.gnn.state_dict()
         ckpt = {
             'state_dict': state_dict,
             'train_score': train_stat['score'],

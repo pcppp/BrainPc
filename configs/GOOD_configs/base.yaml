@@ -19,10 +19,12 @@ train:
   alpha: 10.0  # parameter for DANN
   stage_stones: []
 model:
+  cnn_out_channels: 128
+  lstm_hidden_size: 128
   dim_hidden: 100
   dim_ffn: 100
-  dropout_rate: 0.5
-  use_cwn: False # False / True
+  dropout_rate: 0.7
+  use_cnn: True # False / True
 dataset:
   dataloader_name: BaseDataLoader
   dataset_root: null
@@ -33,3 +35,4 @@ dataset:
   num_envs: null
 ood:
   extra_param: null
+  ood_alg: BrainOOD

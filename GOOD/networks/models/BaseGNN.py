@@ -60,9 +60,10 @@ class GNNBasic(torch.nn.Module):
             else:
                 raise ValueError(f"forward's args should take 2 or 3 arguments but got {len(args)}")
         else:
-            x, edge_index, batch = data.x, data.edge_index, data.batch
+            x, edge_index, edge_weight,batch = data.x, data.edge_index,data.edge_weight, data.batch
 
             # 检查是否有拓扑特征，挂载默认值或报错
+            ball_id = getattr(data, 'ball_id', None)
             x_0 = getattr(data, 'x_0', None)
             x_1 = getattr(data, 'x_1', None)
             x_2 = getattr(data, 'x_2', None)
@@ -75,19 +76,17 @@ class GNNBasic(torch.nn.Module):
             adjacency_1 = getattr(data, 'adjacency', None)
             incidence_2 = getattr(data, 'incidence_2', None)
             incidence_1_t = getattr(data, 'incidence_1_t', None)
-
         if self.config.model.model_level != 'node':
             # --- Maybe batch size --- Reason: some method may filter graphs leading inconsistent of batch size
             batch_size: int = kwargs.get('batch_size') or (batch[-1].item() + 1)
 
-        if self.config.model.model_level == 'node':
-            edge_weight = kwargs.get('edge_weight')
-            return x, edge_index, edge_weight, batch
+        if edge_weight != None:
+            return x, edge_index, edge_weight, batch, batch_size
         elif self.config.dataset.dim_edge:
             edge_attr = data.edge_attr
             return x, edge_index, edge_attr, batch, batch_size
 
-        return x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t
+        return x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t,ball_id
 
     def probs(self, *args, **kwargs):
         # nodes x classes

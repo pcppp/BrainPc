@@ -19,6 +19,7 @@ from .Classifiers import Classifier
 from .MolEncoders import AtomEncoder, BondEncoder
 from torch.nn import Identity
 from .Diffusion import DenoiseModel
+from torch_scatter import scatter_mean, scatter_add, scatter_max, scatter_min
 
 
 @register.model_register
@@ -111,6 +112,10 @@ class DGINFeatExtractor(GNNBasic):
         for k, v in config.ood.items():
             print(f"{k}: {v}")
         print("启用CWN：",config.model.use_cwn)    
+        print("启用GranularBall：",config.model.use_granularBall)    
+        self.use_granularBall = config.model.use_granularBall == True
+        # ============================================== CWN ================================================================
+        self.cls_head = nn.Linear(config.model.dim_hidden, config.dataset.num_classes)
         self.use_cwn = config.model.use_cwn == True
         self.lin_0 = torch.nn.Linear(100, 1)
         self.lin_1 = torch.nn.Linear(1, 1)
@@ -122,13 +127,14 @@ class DGINFeatExtractor(GNNBasic):
             hid_channels=config.model.dim_hidden,
             n_layers=config.model.model_layer)
         num_layer = config.model.model_layer
+         # ================================================================================================================
         if config.dataset.dataset_type == 'mol':
             raise NotImplementedError
         else:
             self.encoder = GINEncoder(config, **kwargs)
             self.hp_encoder = HPGINEncoder(config, **kwargs)
-            # self.mask_emb = nn.Parameter(torch.randn(config.model.dim_hidden, config.model.dim_hidden), requires_grad=True)
-            self.mask_emb = nn.Parameter(torch.randn(config.dataset.in_channels_0, config.dataset.in_channels_0), requires_grad=True)
+            self.mask_emb = nn.Parameter(torch.randn(config.model.dim_hidden, config.model.dim_hidden), requires_grad=True)
+            # self.mask_emb = nn.Parameter(torch.randn(config.dataset.in_channels_0, config.dataset.in_channels_0), requires_grad=True)
             self.feat_dropout = nn.Dropout(config.ood.feature_dropout)
             # self.fuse = nn.Linear(2 * config.model.dim_hidden, config.model.dim_hidden)
             # self.fuse = nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
@@ -147,70 +153,35 @@ class DGINFeatExtractor(GNNBasic):
         Returns (Tensor):
             node feature representations
         """
-        x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t= self.arguments_read(*args, **kwargs)
+        x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t,ball_id= self.arguments_read(*args, **kwargs)
         
         # x = self.feat_dropout(x)
         kwargs.pop('batch_size', 'not found')
+
         # generate a learnable mask
         dim = x.shape[-1]
         bz = int(x.shape[0] / dim)
         single_mask = torch.mm(self.mask_emb, self.mask_emb.t()).sigmoid()
         single_mask = self.feat_dropout(single_mask)
         mask = single_mask.repeat(bz, 1).view(bz * dim, dim)
-        x = x * mask
+        # x = x * mask # 消融节点特征掩码
         loss = 0.0
         gin_graph = self.encoder(x, edge_index, batch, batch_size, **kwargs)
-        kwargs_node = kwargs.copy()  # 复制原始 kwargs
-        kwargs_node['without_readout'] = True  # 设置为获取节点级特征
-        gin_node_features = self.encoder(x, edge_index, batch, batch_size,  **kwargs_node)
+        # kwargs_node = kwargs.copy()  # 复制原始 kwargs
+        # kwargs_node['without_readout'] = True  # 设置为获取节点级特征
+        # gin_node_features = self.encoder(x, edge_index, batch, batch_size,  **kwargs_node)
         out_readout = gin_graph
         # 🔧 将节点级特征按图分割
-        gin_node_list = []
-        start_idx = 0
-        for i in range(batch_size):
-            # 提取当前图的节点特征
-            num_nodes = 100
-            graph_nodes = gin_node_features[start_idx:start_idx + num_nodes]
-            gin_node_list.append(graph_nodes)
-            start_idx += num_nodes
+        # gin_node_list = []
+        # start_idx = 0
+        # for i in range(batch_size):
+        #     # 提取当前图的节点特征
+        #     num_nodes = 100
+        #     graph_nodes = gin_node_features[start_idx:start_idx + num_nodes]
+        #     gin_node_list.append(graph_nodes)
+        #     start_idx += num_nodes
             
             # print(f"图 {i}: 节点数 = {num_nodes}, 节点特征形状 = {graph_nodes.shape}")
-        if(self.use_cwn):
-            cwn0_list = []  
-            # 🔧 使用原始batch信息，避免信息损失
-            from torch_geometric.utils import to_dense_batch
-            for x0,x1,x2,adjacency1,incidence2,incidence1_t in zip(gin_node_list,x_1,x_2, adjacency_1, incidence_2, incidence_1_t):
-                # x0 = self.lin_0(x0)
-                # x1 = self.lin_1(x1) 
-                # x2 = self.lin_2(x2)
-                cwn_0, cwn_1, cwn_2 = self.cwn_model(x0, x1, x2, adjacency1, incidence2, incidence1_t)
-                cwn0_list.append(cwn_0)
-            from torch_scatter import scatter_mean
-            torch.nn.BCEWithLogitsLoss()
-            device = cwn0_list[0].device
-            lens = torch.tensor([t.size(0) for t in cwn0_list], device=device)  # (num_graphs,)
-            batch_index = torch.repeat_interleave(
-                torch.arange(len(cwn0_list), device=device), lens
-            )  # 形状 (sum V_i,)
-            cwn0_cat = torch.cat(cwn0_list, dim=0)    
-            # 🔧 使用 to_dense_batch 将节点特征按图分组
-            cwn_dense, cwn_mask = to_dense_batch(cwn0_cat, batch)
-            # cwn_dense: [batch_size, max_nodes, hidden_dim] = [64, 100, hidden_dim]
-            # cwn_mask: [batch_size, max_nodes] = [64, 100] - 指示哪些节点是真实的
-            graph_0 = scatter_mean(cwn0_cat, batch_index, dim=0)
-            if(kwargs.get('without_readout')):
-                cwn_graph = cwn0_cat
-            else :
-                cwn_graph = []
-                for i in range(batch_size):
-                    # 获取第 i 个图的真实节点特征
-                    real_nodes = cwn_dense[i][cwn_mask[i]]  # [num_real_nodes, hidden_dim]
-                    graph_feat = real_nodes.mean(dim=0, keepdim=True)  # [1, hidden_dim]
-                    cwn_graph.append(graph_feat)
-                cwn_graph = torch.cat(cwn_graph, dim=0)  # [64, hidden_dim]
-            if gin_graph.size(-1) != cwn_graph.size(-1):
-                raise RuntimeError(f"GIN与CWN隐藏维度不一致: {gin_graph.size(-1)} vs {cwn_graph.size(-1)}")
-            out_readout = cwn_graph
 
         if kwargs.get('without_readout'):
             self.ent_loss = self.entropy_loss(single_mask)
@@ -343,7 +314,6 @@ class GINEncoder(BasicEncoder):
         super(GINEncoder, self).__init__(config, *args, **kwargs)
         num_layer = config.model.model_layer
         self.without_readout = kwargs.get('without_readout')
-
         # self.atom_encoder = AtomEncoder(config.model.dim_hidden)
 
         if kwargs.get('without_embed'):
@@ -389,7 +359,7 @@ class GINEncoder(BasicEncoder):
         Returns (Tensor):
             node feature representations
         """
-
+        return_two = kwargs.get('return_two')
         post_conv = x + self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index))))
         for i, (conv, batch_norm, relu, dropout) in enumerate(
                 zip(self.convs, self.batch_norms, self.relus, self.dropouts)):
@@ -399,8 +369,12 @@ class GINEncoder(BasicEncoder):
             post_conv = post_conv + dropout(hidden_x)
 
         if self.without_readout or kwargs.get('without_readout'):
+            if(return_two):
+                return out_readout,post_conv
             return post_conv
         out_readout = self.readout(post_conv, batch, batch_size)
+        if(return_two):
+            return out_readout,post_conv # 图 , 节点
         return out_readout
 
 

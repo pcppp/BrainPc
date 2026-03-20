@@ -65,6 +65,102 @@ class SimpleCNN(nn.Module):
         # Global pooling: (N, C, T) -> (N, C, 1) -> (N, C)
         x = self.pool(x).squeeze(-1)
         return x
+class GBGMT(GNNBasic):
+
+    def __init__(self, config: Union[CommonArgs, Munch]):
+        super(GDGMT, self).__init__(config)
+        # -------------------------------使用GIN
+        # self.gnn = DGINFeatExtractor(config)
+        # self.extractor = ExtractorMLP(config) # 边特征提取器
+        # -------------------------------使用GAT
+        self.gnn = GATFeatExtractor(config)
+        self.classifier = Classifier(config)
+        self.sampling_method = config.ood.extra_param[0]
+        self.sampling_rounds = config.ood.extra_param[3]
+        self.config = config
+
+        self.causal_adj = None
+        self.diffusion_loss = 0.0
+        self.entropy_loss = 0.0
+        # === 【新增 1】 定义 Projection Head (用于预训练) ===
+        # 假设 gnn 输出维度是 config.model.dim_hidden
+        # 这是一个简单的 MLP: Hidden -> ReLU -> Hidden -> Out
+        self.proj_head = nn.Sequential(
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden) 
+            # 最后的维度通常比较小，或者保持一致，看具体对比损失函数要求
+        )
+
+        # === 【新增 2】 当前模式标记 ===
+        self.mode = 'finetune' # 默认为微调/正常模式
+    def forward(self, *args, **kwargs):
+        r"""
+        The GSAT model implementation.
+
+        Args:
+            *args (list): argument list for the use of arguments_read. Refer to :func:`arguments_read <GOOD.networks.models.BaseGNN.GNNBasic.arguments_read>`
+            **kwargs (dict): key word arguments for the use of arguments_read. Refer to :func:`arguments_read <GOOD.networks.models.BaseGNN.GNNBasic.arguments_read>`
+
+        Returns (Tensor):
+            Label predictions and other results for loss calculations.
+
+        """
+        # === 【新增 4】 预训练模式的 Forward 逻辑 ===
+        if self.mode == 'pretrain':
+            # 预训练时，通常不需要多次采样取平均（除非你想对比“平均后”的特征）
+            # 我们直接提取特征并通过 Projection Head
+            
+            # 获取 GNN 特征 (x_out)
+            # 注意：这里假设 self.gnn 返回 (features, loss)
+            x_out, diff_loss = self.gnn(*args, **kwargs)
+            
+            # 将特征映射到对比空间
+            projection = self.proj_head(x_out)
+            
+            # 返回投影向量 (用于算 Contrastive Loss)
+            # 注意：预训练通常不看 diff_loss，或者你需要手动把它加到 total loss 里
+            return projection
+        
+        sampling_logits = []
+        sampling_trials = self.sampling_rounds
+        # # 多次采样取平均,通过边概率控制哪些结构重要
+        while len(sampling_logits)<sampling_trials:
+            x_out, diff_loss = self.gnn(*args, **kwargs)
+            sampling_logits.append(self.classifier(x_out))
+        logits = torch.stack(sampling_logits).mean(dim=0)
+
+        return logits
+    # === 【新增 3】 实现 set_mode 方法 ===
+    def set_mode(self, mode):
+        r"""
+        切换模型的工作模式：'pretrain' vs 'finetune'
+        """
+        self.mode = mode
+        
+        if mode == 'pretrain':
+            # --- 预训练模式 ---
+            # 1. 启用 Projection Head
+            for param in self.proj_head.parameters():
+                param.requires_grad = True
+            
+            # 2. 冻结 Classifier (不让它更新，也不计算梯度，省显存)
+            for param in self.classifier.parameters():
+                param.requires_grad = False
+                
+        elif mode == 'finetune':
+            # --- 微调模式 ---
+            # 1. 启用 Classifier
+            
+            for param in self.classifier.parameters():
+                param.requires_grad = True
+            
+            # 2. 冻结/弃用 Projection Head
+            for param in self.proj_head.parameters():
+                param.requires_grad = False
+        
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 @register.model_register
 class GDGMT(GNNBasic):
 
@@ -190,6 +286,7 @@ class GDGMT(GNNBasic):
         # att = self.gumbel_softmax_sample(att_log_logits, temp=1, training=training)
         # att = self.logistic_sample(att_log_logits, temp=1, training=training)
         return att
+    @register.model_register
 
     @staticmethod
     def lift_node_att_to_edge_att(node_att, edge_index):

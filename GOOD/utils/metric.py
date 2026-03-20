@@ -91,10 +91,10 @@ class Metric(object):
         pred_label = torch.tensor(y_pred)
         if self.dataset_task == "Binary classification":
             pred_label = pred_label.round()
-            return f1_score(true, pred_label)
+            return f1_score(true, pred_label, zero_division=0)
         else:
             torch.argmax(pred_label, dim=1)
-            return f1_score(true, pred_label, average='micro')
+            return f1_score(true, pred_label, average='micro', zero_division=0)
 
     def ap(self, y_true, y_pred):
         r"""
@@ -179,10 +179,10 @@ class Metric(object):
         pred_label = torch.tensor(y_pred)
         if self.dataset_task == "Binary classification":
             pred_label = pred_label.round()
-            return precision_score(true, pred_label)
+            return precision_score(true, pred_label, zero_division=0)
         else:
             torch.argmax(pred_label, dim=1)
-            return precision_score(true, pred_label, average='micro')
+            return precision_score(true, pred_label, average='micro', zero_division=0)
 
     def recall(self, y_true, y_pred):
         r"""
@@ -200,10 +200,10 @@ class Metric(object):
         pred_label = torch.tensor(y_pred)
         if self.dataset_task == "Binary classification":
             pred_label = pred_label.round()
-            return recall_score(true, pred_label)
+            return recall_score(true, pred_label, zero_division=0)
         else:
             torch.argmax(pred_label, dim=1)
-            return recall_score(true, pred_label, average='micro')
+            return recall_score(true, pred_label, average='micro', zero_division=0)
 
     def rmse(self, y_true, y_pred):
         r"""

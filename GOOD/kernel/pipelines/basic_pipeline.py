@@ -44,7 +44,44 @@ class Pipeline:
         self.loader: Union[DataLoader, Dict[str, DataLoader]] = loader
         self.ood_algorithm: BaseOODAlg = ood_algorithm
         self.config: Union[CommonArgs, Munch] = config
+    # --- 辅助函数：图数据增强 ---
+    # 你可以把它放在类里，或者 utils 里
+    def augment_graph(self, data, config):
+        """
+        简单的图增强示例：随机丢弃边 (Edge Dropping)
+        """
+        import torch_geometric.transforms as T
+        from torch_geometric.utils import dropout_edge
 
+        # 这里的 p 是丢弃边的概率，可以在 config 里设置
+        aug_prob = getattr(config.train, 'aug_prob', 0.2) 
+        
+        # 1. 边扰动
+        edge_index, edge_mask = dropout_edge(data.edge_index, p=aug_prob, training=True)
+        data.edge_index = edge_index
+        
+        # 2. 【关键修正】如果 data 里有 edge_weight 或 edge_attr，必须用 edge_mask 同步筛选
+        if hasattr(data, 'edge_weight') and data.edge_weight is not None:
+            # 只有当 edge_weight 和 edge_index 长度一致时才筛选 (防止有些 edge_weight 是空的或者形状不同)
+            if data.edge_weight.size(0) == edge_mask.size(0):
+                data.edge_weight = data.edge_weight[edge_mask]
+                
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+             if data.edge_attr.size(0) == edge_mask.size(0):
+                data.edge_attr = data.edge_attr[edge_mask]
+        
+        # 3. 如果有 edge_norm (有些 GNN 实现会用这个名字)，也处理一下
+        if hasattr(data, 'edge_norm') and data.edge_norm is not None:
+             if data.edge_norm.size(0) == edge_mask.size(0):
+                data.edge_norm = data.edge_norm[edge_mask]
+        # 2. 特征扰动 (可选: Masking Node Features)
+        x = data.x
+        mask_rate = 0.1
+        mask = torch.rand(x.size()) < mask_rate
+        x[mask] = 0
+        data.x = x
+        
+        return data
     def train_batch(self, data: Batch, pbar) -> dict:
         r"""
         Train a batch. (Project use only)
@@ -59,20 +96,59 @@ class Pipeline:
 
         self.ood_algorithm.optimizer.zero_grad()
 
-        mask, targets = nan2zero_get_mask(data, 'train', self.config)
-        node_norm = data.get('node_norm') if self.config.model.model_level == 'node' else None
-        node_norm = node_norm.reshape(targets.shape) if node_norm is not None else None
-        data, targets, mask, node_norm = self.ood_algorithm.input_preprocess(data, targets, mask, node_norm,
-                                                                             self.model.training,
-                                                                             self.config)
-        edge_weight = data.get('edge_weight') if hasattr(data, 'edge_weight') else data.get('edge_norm')
+        # 获取当前模式 (默认 finetune 以防未设置)
+        current_mode = getattr(self.ood_algorithm, 'current_mode', 'finetune')
 
-        model_output = self.model(data=data, edge_weight=edge_weight, ood_algorithm=self.ood_algorithm)
-        raw_pred = self.ood_algorithm.output_postprocess(model_output)
+        # ==================================================
+        # 分支 A: 预训练模式 (Contrastive Learning)
+        # ==================================================
+        if current_mode == 'pretrain':
+            # 1. 数据增强：生成两个视图 (View Generation)
+            # 这里调用一个辅助函数对图进行扰动 (随机去边、掩码特征等)
+            # 注意：data 需要 clone，否则会修改原数据
+            view1 = self.augment_graph(data.clone(), self.config)
+            view2 = self.augment_graph(data.clone(), self.config)
+            
+            # 2. 前向传播：跑两次模型 (此时 model 会自动走 proj_head)
+            # 注意：不需要 edge_weight 或 targets，因为是无监督
+            out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
+            out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)
+            
+            # 3. 计算损失
+            # 将两个视图的输出打包传给 loss_calculate
+            # targets 传 None，因为是自监督
+            raw_pred = (out1, out2) 
+            loss = self.ood_algorithm.loss_calculate(raw_pred, None, None, None, self.config)
 
-        loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
-        loss = self.ood_algorithm.loss_postprocess(loss, data, mask, self.config)
+        # ==================================================
+        # 分支 B: 微调/分类模式 (Original Logic)
+        # ==================================================
+        else:
+            # 1. 准备标签和掩码
+            mask, targets = nan2zero_get_mask(data, 'train', self.config)
+            node_norm = data.get('node_norm') if self.config.model.model_level == 'node' else None
+            node_norm = node_norm.reshape(targets.shape) if node_norm is not None else None
+            
+            # 2. 数据预处理
+            data, targets, mask, node_norm = self.ood_algorithm.input_preprocess(
+                data, targets, mask, node_norm, self.model.training, self.config
+            )
+            
+            # 3. 获取边权重 (如果有)
+            edge_weight = data.get('edge_weight') if hasattr(data, 'edge_weight') else data.get('edge_norm')
 
+            # 4. 前向传播 (此时 model 会自动走 classifier)
+            model_output = self.model(data=data, edge_weight=edge_weight, ood_algorithm=self.ood_algorithm)
+            
+            # 5. 后处理与损失
+            raw_pred = self.ood_algorithm.output_postprocess(model_output)
+            loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
+        # ==================================================
+        # 公共部分：反向传播
+        # ==================================================
+        # 处理 loss 格式 (如果是 dict 或其他格式)
+        loss = self.ood_algorithm.loss_postprocess(loss, data, None, self.config)
+        
         self.ood_algorithm.backward(loss)
 
         return {'loss': loss.detach()}
@@ -81,16 +157,51 @@ class Pipeline:
         r"""
         Training pipeline. (Project use only)
         """
-        # config model
-        # print('#D#Config model')
+
+        # 1. 初始化配置
         self.config_model('train', fold)
-
-        # Load training utils
-        # print('#D#Load training utils')
+        # 2. 设置为【预训练模式】
         self.ood_algorithm.set_up(self.model, self.config)
+        # 现在是对比学习
+        self.ood_algorithm.set_stage('pretrain',self.config)
+        # ==========================================
+        # 第一阶段：预训练 (Pre-training)
+        # ==========================================
+        pretrain_epochs = getattr(self.config.train, 'pre_epoch', 50)
 
+        for epoch in range(pretrain_epochs):
+            self.config.train.epoch = epoch # 记录当前 epoch
+            
+            # ... (此处保留原本的进度条和 loop 代码，但略作简化) ...
+            mean_loss = 0
+            self.ood_algorithm.stage_control(self.config) # 某些动态调整
+
+            for index, data in enumerate(self.loader['train']):
+                if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
+                    continue
+                
+                # 注意：预训练通常不需要 DANN 的 alpha 参数，或者 alpha 策略不同
+                # 如果对比学习也是跨域的，可以保留 alpha 计算
+                
+                # train_batch 内部需要根据 current_stage 判断是用 Contrastive Loss 还是 CrossEntropy
+                train_stat = self.train_batch(data, None) 
+                mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
+            
+            print(f'#IN# Pre-train Epoch {epoch}: Contrastive Loss {mean_loss:.4f}')
+            
+            # 预训练阶段通常不需要频繁做完整的 val/test 评估，或者只看 loss 即可
+            # 如果想看 embedding 质量，可以加简单的评估
+
+        # ==========================================
+        # 切换到微调模式
+        # ==========================================
+        print(">>> [Snapshot] 正在保存预训练模型快照 (temp_pretrain_snapshot.pt)...")
+        # 保存到当前目录下，方便读取
+        torch.save(self.model.state_dict(), 'temp_pretrain_snapshot.pt')
+        self.ood_algorithm.set_stage('finetune',self.config)
+        finetune_epochs = getattr(self.config.train, 'ft_epochs', self.config.train.max_epoch)
         # train the model
-        for epoch in range(self.config.train.ctn_epoch, self.config.train.max_epoch):
+        for epoch in range(finetune_epochs):
             self.config.train.epoch = epoch
             # print(f'#IN#Epoch {epoch}:')
 
@@ -106,7 +217,7 @@ class Pipeline:
                     continue
 
                 # Parameter for DANN
-                p = (index / len(self.loader['train']) + epoch) / self.config.train.max_epoch
+                p = (index / len(self.loader['train']) + epoch) / finetune_epochs
                 self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
                 # train a batch
                 # train_stat = self.train_batch(data, pbar)

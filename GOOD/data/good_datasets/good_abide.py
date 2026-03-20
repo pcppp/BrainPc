@@ -160,7 +160,7 @@ class GOODABIDE(InMemoryDataset):
         
        
         # G_dataset, Labels = load_graphs('./GOOD/data/bin_gb_dataset/abide_gb.bin')
-        G_dataset, Labels = load_graphs('./GOOD/data/bin_time_dataset/abide.bin')
+        G_dataset, Labels = load_graphs('./GOOD/data/bin_dataset/abide.bin')
         # G_dataset, Labels = load_graphs('./GOOD/data/bin_dataset/abide.bin')
 
 

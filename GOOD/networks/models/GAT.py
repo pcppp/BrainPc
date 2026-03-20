@@ -58,6 +58,7 @@ class GATFeatExtractor(GNNBasic):
         self.encoder = GATEncoder(config)
         self.edge_feat = False
 
+
     def forward(self, x=None, *args, **kwargs):
         r"""
         GAT feature extractor using the :class:`~GATEncoder`.
@@ -112,7 +113,7 @@ class DGATFeatExtractor(GNNBasic):
         kwargs.pop('batch_size', 'not found')
         # x, loss = self.diffusion(x)
         loss = 0.0
-        out_readout = self.encoder(x, edge_index, batch, batch_size, **kwargs)
+        out_readout , z= self.encoder(x, edge_index, batch, batch_size, **kwargs)
         if kwargs.get('without_readout'):
             post_diffusion = self.hp_encoder(out_readout, edge_index, batch, batch_size, **kwargs)
             dim = post_diffusion.shape[-1]
@@ -151,6 +152,12 @@ class GATEncoder(BasicEncoder):
                 for _ in range(num_layer - 1)
             ]
         )
+        # 训练对比学习的loss
+        self.projection_head = nn.Sequential(
+            nn.Linear(config.model.dim_hidden,config.model.dim_hidden),
+            nn.ReLU(),
+            nn.Linear(config.model.dim_hidden,config.model.dim_hidden)
+        )
 
     def forward(self, x, edge_index,edge_weight, batch, batch_size, **kwargs):
         r"""
@@ -175,7 +182,8 @@ class GATEncoder(BasicEncoder):
         if kwargs.get('without_readout'):
             return post_conv
         out_readout = self.readout(post_conv, batch, batch_size)
-        return out_readout,None
+        z = self.projection_head(out_readout)
+        return out_readout,z
 
 
 class GATConv(gnn.GATConv):

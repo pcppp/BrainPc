@@ -25,6 +25,7 @@ from GOOD.definitions import OOM_CODE
 from GOOD.utils.data.utils import convert_graph_dataset_with_rings
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+from GOOD.utils.visualize_tsne import extract_embeddings, plot_tsne_comparison
 
 def initialize_model_dataset(config: Union[CommonArgs, Munch], fold: int = 0) -> Tuple[torch.nn.Module, Union[dict, DataLoader]]:
     r"""
@@ -170,10 +171,58 @@ def run_10fold_once(config):
         pipeline = load_pipeline(config.pipeline, config.task, model, loader, ood_algorithm, config)
         if i == 0:
             view_model_param(pipeline.model)
-
+        # ================= [可视化核心代码 Start] =================
+        # 仅在第 1 折 (Fold 0) 进行可视化，节省时间
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        emb_before, y_before = None, None
+        if i == 0:
+            print(">>> [t-SNE] Extracting embeddings BEFORE training...")
+            # 注意：loader 通常是字典，我们需要选一个用于可视化的子集
+            # 优先使用 'id_val' 或 'val'，如果没有则用 'train'
+            vis_loader_key = 'id_val' if 'id_val' in loader else ('val' if 'val' in loader else 'train')
+            vis_loader = loader[vis_loader_key]
+            
+            try:
+                # 传入 config 以便内部获取 device 或其他参数
+                emb_before, y_before = extract_embeddings(model, vis_loader, config.device)
+            except Exception as e:
+                print(f"#WARNING# t-SNE extraction failed before training: {e}")
+        # ================= [可视化核心代码 End] =================
         # 训练
         pipeline.load_task(fold=i)
 
+        # ================= [可视化核心代码 Start] =================
+        if i == 0 and emb_before is not None:
+            print(">>> [t-SNE] Extracting embeddings AFTER training...")
+            try:
+               
+                # 生成对比图
+                plot_name = f"tsne_fold{i}_L1_{config.ood.entropy_trade_off}_L2_{config.ood.trade_off}.png"
+                save_path = log_dir / plot_name
+                
+                # strict=False 很重要：因为微调阶段可能加了分类头，预训练权重里没有，不加这个会报错
+                model.load_state_dict(torch.load('temp_pretrain_snapshot.pt'), strict=False)
+                print(">>> [Snapshot] 快照加载成功！现在的模型回到了纯对比学习状态。")
+                
+                # 提取【预训练状态】 (After Pretrain)
+                emb_pretrain, y_pretrain = extract_embeddings(model, vis_loader, config.device, max_samples=500)
+                
+                # 5. 画图：重点对比 [初始 vs 预训练]
+                if emb_before is not None and emb_pretrain is not None:
+                    plot_name = f"Effect_of_CL_fold{i}_L1_{config.ood.entropy_trade_off}.png"
+                    
+                    # 这里的 labels 用 y_before (真值标签) 来上色，
+                    # 看看无监督的对比学习是否把同类聚在一起了
+                    plot_tsne_comparison(
+                        emb_before, y_before, 
+                        emb_pretrain, y_pretrain, 
+                        save_path=save_path
+                    )
+                    print(f">>> [Success] 对比学习效果图已保存: {plot_name}")
+            except Exception as e:
+                print(f"#WARNING# t-SNE extraction/plotting failed after training: {e}")
+        # ================= [可视化核心代码 End] =================
         # 测试（按你原逻辑）
         if config.task == 'train':
             pipeline.task = 'test'
@@ -220,9 +269,9 @@ def main():
     lambda1_list = [0.1]   # entropy_trade_off [0.1, 0.01, 0.001]   
     lambda2_list = [1.0]     # trade_off [1.0, 0.1, 0.01]
     lambda3_list = [1.0]      # diffusion_trade_off [1.0, 0.5, 0.1] 
-    epoch_list = [100]
+    epoch_list = [60]
     # lr_list = [2e-3,4e-3,6e-3,8e-3,1e-2]
-    lr_list = [6e-5]
+    lr_list = [1e-3]
     total = len(lambda1_list) * len(lambda2_list) * len(lambda3_list)*len(epoch_list)*len(lr_list)
    
     # XML

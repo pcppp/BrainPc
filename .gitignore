@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# Packaging
+graph_ood.egg-info/
+
+# Training outputs and local artifacts
+logs/
+storage/
+*.pt
+*.pth
+*.ckpt
+*.xlsx
+*.xml
+*.png
+
+# Local datasets / preprocessed binaries
+GOOD/data/bin_dataset/
+GOOD/data/bin_time_dataset/
+GOOD/data/bin_gb_dataset/
+GOOD/data/dataset/
+GOOD/dataPre/
+GOOD/data/good_datasets/abide_full_ood_schaefer100 copy/
+/TopoModelX/
+.idea/
+*.iml

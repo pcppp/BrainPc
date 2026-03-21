@@ -1,4 +1,4 @@
-import os, re, glob, json, csv
+import os, re, glob
 import numpy as np
 import scipy.io
 import torch
@@ -9,6 +9,7 @@ from dgl.data.utils import save_graphs
 import pywt
 
 BASEDIR = 'GOOD/data'
+EPS = 1e-8
 
 def _key_from_path(p: str) -> str:
     """把文件名标准化成 subject key，用于 TS/FC 配对"""
@@ -16,10 +17,70 @@ def _key_from_path(p: str) -> str:
     b = re.sub(r'_schaefer100_(features_timeseries|correlation_matrix)\.mat$', '', b)
     return b
 
+def _resolve_mat_key(mat_dict: dict, preferred_key: str = "data") -> str:
+    if preferred_key in mat_dict:
+        return preferred_key
+
+    candidates = [
+        (k, np.asarray(v))
+        for k, v in mat_dict.items()
+        if not k.startswith('__') and np.asarray(v).ndim == 2
+    ]
+    if not candidates:
+        raise KeyError(f'No 2D array found in keys: {list(mat_dict.keys())}')
+
+    for key in ('data', 'fc', 'features', 'timeseries'):
+        for candidate_key, _ in candidates:
+            if candidate_key == key:
+                return candidate_key
+    return max(candidates, key=lambda item: item[1].size)[0]
+
+
 def _load_mat(path: str, key: str = "data") -> np.ndarray:
-    m = scipy.io.loadmat(path)
-    x = np.asarray(m[key], dtype=np.float32)
-    return x
+    mat = scipy.io.loadmat(path)
+    actual_key = _resolve_mat_key(mat, preferred_key=key)
+    array = np.asarray(mat[actual_key], dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError(f'{path} does not contain a 2D matrix under key {actual_key}: {array.shape}')
+    if not np.isfinite(array).all():
+        print(f'[WARN] {path} contains NaN/Inf values under key {actual_key}; replacing them with 0.')
+        array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    return array
+
+
+def _ensure_node_by_time(ts: np.ndarray) -> np.ndarray:
+    if ts.ndim != 2:
+        raise ValueError(f'Timeseries must be 2D, but got shape {ts.shape}.')
+    if ts.shape[0] >= ts.shape[1]:
+        return ts.T.copy()
+    return ts.copy()
+
+
+def _load_fc_matrix(path: str, num_nodes: int) -> np.ndarray:
+    fc = _load_mat(path, key='data')
+    if fc.shape != (num_nodes, num_nodes):
+        raise ValueError(f'FC shape mismatch in {path}: expected {(num_nodes, num_nodes)}, got {fc.shape}')
+    fc = np.nan_to_num(fc, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    fc = (fc + fc.T) / 2.0
+    np.fill_diagonal(fc, 0.0)
+    return fc
+
+
+def _zscore_node_features(node_feats: np.ndarray) -> np.ndarray:
+    mean = node_feats.mean(axis=1, keepdims=True)
+    std = node_feats.std(axis=1, keepdims=True)
+    std[std < EPS] = 1.0
+    return ((node_feats - mean) / std).astype(np.float32)
+
+
+def _select_node_features(node_feats: np.ndarray, fc_matrix: np.ndarray, node_feat_transform: str) -> np.ndarray:
+    if node_feat_transform == 'timeseries':
+        return _zscore_node_features(node_feats)
+    if node_feat_transform == 'raw_timeseries':
+        return node_feats.astype(np.float32)
+    if node_feat_transform == 'pearson':
+        return fc_matrix.astype(np.float32)
+    raise NotImplementedError(f"Unsupported node_feat_transform: {node_feat_transform}")
 
 def construct_dataset(dataName,
                       edge_ratio=0.1,
@@ -57,17 +118,13 @@ def construct_dataset(dataName,
         ts_path = ts_map[k]
         fc_path = fc_map[k]
 
-        ts = _load_mat(ts_path, key="data")        # (T,N) 或 (N,T)
-        if ts.ndim != 2:
-            print(f"[WARN] {ts_path} 不是二维数据，跳过：{ts.shape}")
+        try:
+            ts = _load_mat(ts_path, key="data")
+            node_feats = _ensure_node_by_time(ts)
+        except Exception as exc:
+            print(f"[WARN] 读取时间序列失败，跳过 {ts_path}: {exc}")
             continue
 
-        # 统一成 节点×时间 (N×T)
-        R, C = ts.shape
-        if R >= C:          # 常见 (T,N)
-            node_feats = ts.T          # -> (N,T)
-        else:                # (N,T)
-            node_feats = ts            # -> (N,T)
         N, T = node_feats.shape
         if use_wavelet:
             # 小波分解：提取近似系数 (Approximation Coefficients) 以获得平滑宏观信号
@@ -80,22 +137,18 @@ def construct_dataset(dataName,
             N, T = node_feats.shape
 
 
-        # 读入Pearson相关矩阵 FC (N×N) 作为边权
-        # FC = _load_mat(fc_path, key="data")        # (N,N)
-        # 改为直接从节点特征计算 Pearson 相关系数
-        FC = np.corrcoef(node_feats)
-        if FC.shape != (N, N):
-            print(f"[WARN] 尺寸不匹配，跳过：TS(N={N}) vs FC{FC.shape} in {k}")
+        try:
+            fc_matrix = _load_fc_matrix(fc_path, num_nodes=N)
+        except Exception as exc:
+            print(f"[WARN] 读取相关矩阵失败，跳过 {fc_path}: {exc}")
             continue
-        np.fill_diagonal(FC, 0.0)
 
         # 构建图：FC作为边权（Pearson相关系数）
-        G = nx.from_numpy_array(FC, create_using=nx.DiGraph)
+        G = nx.from_numpy_array(fc_matrix, create_using=nx.DiGraph)
         g = dgl.from_networkx(G, edge_attrs=['weight'])
 
-        # 节点特征：原始时间序列 (N,T)
-        g.ndata['N_features'] = torch.from_numpy(node_feats)
-        # 边特征：Pearson相关系数
+        g.ndata['N_features'] = torch.from_numpy(node_feats.astype(np.float32))
+        g.ndata['FC_features'] = torch.from_numpy(fc_matrix.astype(np.float32))
         g.edata['E_features'] = g.edata.pop('weight').float()
 
         # 提取标签（站点/分组）
@@ -147,8 +200,6 @@ def construct_dataset(dataName,
         G_dataset[i].ndata['N_features'] = nf
 
     # 5) 边稀疏化：保留|权重|最大的边
-    import copy
-    G_origin_dataset = copy.deepcopy(G_dataset)
     edge_ratio = float(edge_ratio)
     
     for i in tqdm(range(len(G_dataset)), desc="边稀疏化"):
@@ -167,35 +218,12 @@ def construct_dataset(dataName,
 
         # 边特征别名
         G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
-
-    # 6) 节点特征变换
-    for i in tqdm(range(len(G_dataset)), desc="节点特征变换"):
-        nf_np = G_dataset[i].ndata['N_features'].cpu().numpy()   # (N,T)
-        N, T = nf_np.shape
-        
-        if node_feat_transform == 'timeseries':
-            # 返回Z-score标准化的时间序列 (N, T)
-            # CNN将直接学习时间模式（卷积核=滑动窗口）
-            mean = nf_np.mean(axis=1, keepdims=True)  # (N, 1)
-            std = nf_np.std(axis=1, keepdims=True) + 1e-8
-            nf_normalized = (nf_np - mean) / std  # Z-score归一化
-            
-            feat_tensor = torch.from_numpy(nf_normalized.astype(np.float32)).clone()
-            G_dataset[i].ndata['feat'] = feat_tensor  # (N, T) 供CNN处理
-            G_origin_dataset[i].ndata['feat'] = feat_tensor.clone()
-            G_dataset[i].ndata['N_features'] = feat_tensor.clone()
-            G_origin_dataset[i].ndata['N_features'] = feat_tensor.clone()
-            
-        elif node_feat_transform == 'pearson':
-            # Pearson相关矩阵 (N, N)
-            nf_corr = np.corrcoef(nf_np, rowvar=True).astype(np.float32)
-            feat_tensor = torch.from_numpy(nf_corr).clone()
-            G_dataset[i].ndata['feat'] = feat_tensor
-            G_origin_dataset[i].ndata['feat'] = feat_tensor.clone()
-            G_dataset[i].ndata['N_features'] = feat_tensor.clone()
-            G_origin_dataset[i].ndata['N_features'] = feat_tensor.clone()
-        else:
-            raise NotImplementedError(f"Unsupported node_feat_transform: {node_feat_transform}")
+        selected_feat = _select_node_features(
+            G_dataset[i].ndata['N_features'].cpu().numpy(),
+            G_dataset[i].ndata['FC_features'].cpu().numpy(),
+            node_feat_transform=node_feat_transform
+        )
+        G_dataset[i].ndata['feat'] = torch.from_numpy(selected_feat).clone()
     
     print(f'完成! 节点特征维度: {G_dataset[0].ndata["N_features"].shape} | 边特征维度: {G_dataset[0].edata["feat"].shape}')
 

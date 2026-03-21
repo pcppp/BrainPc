@@ -12,6 +12,7 @@ This repository has been adapted for local ABIDE experiments. On `feature/remove
 - All CWN and cell-complex-specific runtime inputs have been removed, including `x_0/x_1/x_2`, incidence matrices, adjacency matrices, and custom topo batching.
 - The model path no longer initializes CWN-related channel settings or TopoModelX-based code.
 - The remaining experiment flow keeps the current ABIDE dataset path and graph-level BrainOOD training stack.
+- The ABIDE preprocessing path now keeps raw node timeseries in `N_features`, reads edge connectivity from the original `*_correlation_matrix.mat`, and uses the precomputed `feat` field as the runtime node feature input.
 
 ## Run
 

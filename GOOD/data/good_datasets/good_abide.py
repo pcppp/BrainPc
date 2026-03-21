@@ -146,10 +146,10 @@ class GOODABIDE(InMemoryDataset):
         meta_info = Munch()
         meta_info.dataset_type = 'brain'
         meta_info.model_level = 'graph'
-        meta_info.num_node_features = 100
+        meta_info.num_node_features = None
         meta_info.name = 'abide_full_ood_schaefer100'
         meta_info.edge_ratio = 0.2
-        meta_info.node_feat_transform = 'pearson'
+        meta_info.node_feat_transform = 'precomputed'
         
         with open('./GOOD/data/good_datasets/abide_full_ood_schaefer100/meta.json', 'r') as f:
             meta_json = json.load(f)
@@ -187,16 +187,16 @@ class GOODABIDE(InMemoryDataset):
         #     else:
         #         raise NotImplementedError
         
-        # 不重复进行稀疏化
+        # 优先使用预处理脚本写入的特征视图，缺失时再回退到旧字段。
         for i in tqdm(range(len(G_dataset))):
-            # 边特征：为后续使用创建别名
-            G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
-            
-            # 节点特征：直接使用预处理时已经变换好的特征
-            if meta_info.node_feat_transform == 'pearson':
-                G_dataset[i].ndata['feat'] = G_dataset[i].ndata['N_features'].clone()
-            else:
-                raise NotImplementedError
+            if 'feat' not in G_dataset[i].edata:
+                G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
+
+            if 'feat' not in G_dataset[i].ndata:
+                if 'FC_features' in G_dataset[i].ndata:
+                    G_dataset[i].ndata['feat'] = G_dataset[i].ndata['FC_features'].clone()
+                else:
+                    G_dataset[i].ndata['feat'] = G_dataset[i].ndata['N_features'].clone()
 
         all_idx = get_all_split_idx(meta_info.name)
         train_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['train'][fold]]
@@ -218,7 +218,8 @@ class GOODABIDE(InMemoryDataset):
         test_dataset = GOODABIDE(root=dataset_root,
                                domain=domain, shift=shift, subset='test', generate=generate, data_list=test_data)
 
-        meta_info.dim_node = 100 #train_dataset.num_node_features
+        meta_info.num_node_features = int(G_dataset[0].ndata['feat'].shape[-1])
+        meta_info.dim_node = meta_info.num_node_features
         meta_info.dim_edge = 0 #train_dataset.num_edge_features
 
         # meta_info.num_envs = torch.unique(train_dataset.data.env_id).shape[0]

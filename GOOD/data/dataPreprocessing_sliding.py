@@ -66,6 +66,34 @@ def _load_fc_matrix(path: str, num_nodes: int) -> np.ndarray:
     return fc
 
 
+def _sparsify_fc_matrix(fc_matrix: np.ndarray, edge_ratio: float, topk_per_node: int = 4) -> np.ndarray:
+    num_nodes = fc_matrix.shape[0]
+    if topk_per_node is not None:
+        k = max(1, min(int(topk_per_node), num_nodes - 1))
+        abs_fc = np.abs(fc_matrix)
+        np.fill_diagonal(abs_fc, -np.inf)
+        topk_idx = np.argpartition(abs_fc, -k, axis=1)[:, -k:]
+        mask = np.zeros_like(fc_matrix, dtype=bool)
+        row_idx = np.arange(num_nodes)[:, None]
+        mask[row_idx, topk_idx] = True
+        sparse_fc = np.where(mask, fc_matrix, 0.0).astype(np.float32)
+        np.fill_diagonal(sparse_fc, 0.0)
+        return sparse_fc
+
+    if edge_ratio >= 1.0:
+        return fc_matrix.astype(np.float32)
+
+    num_edges = num_nodes * (num_nodes - 1)
+    keep_edges = max(1, int(num_edges * float(edge_ratio)))
+    flat = np.abs(fc_matrix).reshape(-1)
+    topk_idx = np.argpartition(flat, -keep_edges)[-keep_edges:]
+    mask = np.zeros_like(flat, dtype=bool)
+    mask[topk_idx] = True
+    sparse_fc = np.where(mask.reshape(fc_matrix.shape), fc_matrix, 0.0).astype(np.float32)
+    np.fill_diagonal(sparse_fc, 0.0)
+    return sparse_fc
+
+
 def _zscore_node_features(node_feats: np.ndarray) -> np.ndarray:
     mean = node_feats.mean(axis=1, keepdims=True)
     std = node_feats.std(axis=1, keepdims=True)
@@ -85,7 +113,8 @@ def _select_node_features(node_feats: np.ndarray, fc_matrix: np.ndarray, node_fe
 def construct_dataset(dataName,
                       edge_ratio=0.1,
                       node_feat_transform='timeseries',
-                      use_wavelet=False):
+                      use_wavelet=False,
+                      topk_per_node: int = 4):
     """
     预处理数据集：
       - node_feat_transform='timeseries': 返回Z-score标准化后的时间序列 (N, T)，让CNN自己学习时间模式
@@ -143,8 +172,10 @@ def construct_dataset(dataName,
             print(f"[WARN] 读取相关矩阵失败，跳过 {fc_path}: {exc}")
             continue
 
+        sparse_fc_matrix = _sparsify_fc_matrix(fc_matrix, edge_ratio=edge_ratio, topk_per_node=topk_per_node)
+
         # 构建图：FC作为边权（Pearson相关系数）
-        G = nx.from_numpy_array(fc_matrix, create_using=nx.DiGraph)
+        G = nx.from_numpy_array(sparse_fc_matrix, create_using=nx.DiGraph)
         g = dgl.from_networkx(G, edge_attrs=['weight'])
 
         g.ndata['N_features'] = torch.from_numpy(node_feats.astype(np.float32))
@@ -199,24 +230,9 @@ def construct_dataset(dataName,
             nf = torch.cat([nf, nf[:, -1:].repeat(1, padding)], dim=-1)
         G_dataset[i].ndata['N_features'] = nf
 
-    # 5) 边稀疏化：保留|权重|最大的边
-    edge_ratio = float(edge_ratio)
-    
-    for i in tqdm(range(len(G_dataset)), desc="边稀疏化"):
-        e = G_dataset[i].edata['E_features'].float()  # (E,) Pearson相关系数
-
-        if edge_ratio < 1.0 and e.numel() > 0:
-            M = e.numel()
-            k_keep = max(1, int(M * edge_ratio))
-
-            _, keep_idx = torch.topk(e.abs(), k_keep, largest=True, sorted=False)
-            keep_mask = torch.zeros(M, dtype=torch.bool, device=e.device)
-            keep_mask[keep_idx] = True
-            drop_idx = (~keep_mask).nonzero(as_tuple=False).squeeze(1)
-
-            G_dataset[i].remove_edges(drop_idx)
-
-        # 边特征别名
+    # 5) 写入运行时视图
+    edge_counts = []
+    for i in tqdm(range(len(G_dataset)), desc="写入运行时特征"):
         G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
         selected_feat = _select_node_features(
             G_dataset[i].ndata['N_features'].cpu().numpy(),
@@ -224,6 +240,13 @@ def construct_dataset(dataName,
             node_feat_transform=node_feat_transform
         )
         G_dataset[i].ndata['feat'] = torch.from_numpy(selected_feat).clone()
+        edge_counts.append(int(G_dataset[i].num_edges()))
+
+    if edge_counts:
+        print(
+            f'edge_count stats -> min: {min(edge_counts)}, '
+            f'avg: {sum(edge_counts) / len(edge_counts):.2f}, max: {max(edge_counts)}'
+        )
     
     print(f'完成! 节点特征维度: {G_dataset[0].ndata["N_features"].shape} | 边特征维度: {G_dataset[0].edata["feat"].shape}')
 
@@ -240,5 +263,5 @@ if __name__ == '__main__':
         # 使用 timeseries 模式：返回Z-score标准化的时间序列 (N, T)
         # CNN将直接对时间序列做卷积，自动学习时间模式
         # 边特征：Pearson相关系数（已在E_features中）
-        construct_dataset(data_name, node_feat_transform='timeseries', use_wavelet=True)
+        construct_dataset(data_name, node_feat_transform='timeseries', use_wavelet=True, topk_per_node=4)
     print('Done!')

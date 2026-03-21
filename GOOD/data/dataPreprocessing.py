@@ -67,6 +67,34 @@ def _load_fc_matrix(path: str, num_nodes: int) -> np.ndarray:
     return fc
 
 
+def _sparsify_fc_matrix(fc_matrix: np.ndarray, edge_ratio: float, topk_per_node: int = 4) -> np.ndarray:
+    num_nodes = fc_matrix.shape[0]
+    if topk_per_node is not None:
+        k = max(1, min(int(topk_per_node), num_nodes - 1))
+        abs_fc = np.abs(fc_matrix)
+        np.fill_diagonal(abs_fc, -np.inf)
+        topk_idx = np.argpartition(abs_fc, -k, axis=1)[:, -k:]
+        mask = np.zeros_like(fc_matrix, dtype=bool)
+        row_idx = np.arange(num_nodes)[:, None]
+        mask[row_idx, topk_idx] = True
+        sparse_fc = np.where(mask, fc_matrix, 0.0).astype(np.float32)
+        np.fill_diagonal(sparse_fc, 0.0)
+        return sparse_fc
+
+    if edge_ratio >= 1.0:
+        return fc_matrix.astype(np.float32)
+
+    num_edges = num_nodes * (num_nodes - 1)
+    keep_edges = max(1, int(num_edges * float(edge_ratio)))
+    flat = np.abs(fc_matrix).reshape(-1)
+    topk_idx = np.argpartition(flat, -keep_edges)[-keep_edges:]
+    mask = np.zeros_like(flat, dtype=bool)
+    mask[topk_idx] = True
+    sparse_fc = np.where(mask.reshape(fc_matrix.shape), fc_matrix, 0.0).astype(np.float32)
+    np.fill_diagonal(sparse_fc, 0.0)
+    return sparse_fc
+
+
 def _zscore_node_features(node_feats: np.ndarray) -> np.ndarray:
     mean = node_feats.mean(axis=1, keepdims=True)
     std = node_feats.std(axis=1, keepdims=True)
@@ -84,7 +112,7 @@ def _select_node_features(node_feats: np.ndarray, fc_matrix: np.ndarray, node_fe
     raise NotImplementedError(f'Unsupported node_feat_transform: {node_feat_transform}')
 
 
-def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries'):
+def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries', topk_per_node: int = 4):
     """
     预期 meta_info:
       - name: 数据集名（用于输出）
@@ -130,8 +158,10 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries'):
             print(f"[WARN] 读取相关矩阵失败，跳过 {fc_path}: {exc}")
             continue
 
+        sparse_fc_matrix = _sparsify_fc_matrix(fc_matrix, edge_ratio=edge_ratio, topk_per_node=topk_per_node)
+
         # 非零建边
-        G = nx.from_numpy_array(fc_matrix, create_using=nx.DiGraph)
+        G = nx.from_numpy_array(sparse_fc_matrix, create_using=nx.DiGraph)
         g = dgl.from_networkx(G, edge_attrs=['weight'])
 
         g.ndata['N_features'] = torch.from_numpy(node_feats.astype(np.float32))
@@ -180,25 +210,9 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries'):
             nf = torch.cat([nf, nf[:, -1:].repeat(1, pad)], dim=-1)
         G_dataset[i].ndata['N_features'] = nf
 
-    # 3) 稀疏化：仅删除弱边（按 |w| ），不改权重
-    edge_ratio = float(edge_ratio)
+    # 3) 写入运行时使用的特征视图
+    edge_counts = []
     for i in tqdm(range(len(G_dataset))):
-        e = G_dataset[i].edata['E_features'].float()  # (E,)
-
-        if edge_ratio < 1.0 and e.numel() > 0:
-            M = e.numel()
-            k_keep = max(1, int(M * edge_ratio))      # 保留的边数
-
-            # 取 |w| 最大的 k_keep 条边的索引（完全在 GPU 上完成）
-            _, keep_idx = torch.topk(e.abs(), k_keep, largest=True, sorted=False)  # (k_keep,)
-
-            keep_mask = torch.zeros(M, dtype=torch.bool, device=e.device)
-            keep_mask[keep_idx] = True
-            drop_idx = (~keep_mask).nonzero(as_tuple=False).squeeze(1)            # (M - k_keep,)
-
-            # 原地删除弱边
-            G_dataset[i].remove_edges(drop_idx)
-
         G_dataset[i].edata['feat'] = G_dataset[i].edata['E_features'].unsqueeze(-1).clone()
         selected_feat = _select_node_features(
             G_dataset[i].ndata['N_features'].cpu().numpy(),
@@ -206,6 +220,13 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries'):
             node_feat_transform=node_feat_transform
         )
         G_dataset[i].ndata['feat'] = torch.from_numpy(selected_feat).clone()
+        edge_counts.append(int(G_dataset[i].num_edges()))
+
+    if edge_counts:
+        print(
+            f'edge_count stats -> min: {min(edge_counts)}, '
+            f'avg: {sum(edge_counts) / len(edge_counts):.2f}, max: {max(edge_counts)}'
+        )
 
   # ---------------- 保存 bin ---------------- #
     out_dir = os.path.join(BASEDIR, 'bin_dataset')
@@ -220,7 +241,7 @@ if __name__ == '__main__':
     file_name_list = ['abide']
 
     for data_name in file_name_list:
-        construct_dataset(data_name, 0.2, node_feat_transform='timeseries')
+        construct_dataset(data_name, 0.2, node_feat_transform='timeseries', topk_per_node=4)
         # except:
         #     print('[ERROR]: ' + data_name)
         #     error_name.append(data_name)

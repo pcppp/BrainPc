@@ -13,6 +13,7 @@ This repository has been adapted for local ABIDE experiments. On `feature/remove
 - The model path no longer initializes CWN-related channel settings or TopoModelX-based code.
 - The remaining experiment flow keeps the current ABIDE dataset path and graph-level BrainOOD training stack.
 - The ABIDE preprocessing path now keeps raw node timeseries in `N_features`, reads edge connectivity from the original `*_correlation_matrix.mat`, and uses the precomputed `feat` field as the runtime node feature input.
+- The ABIDE preprocessing path now builds a sparse graph directly from the strongest FC connections per node instead of materializing the dense matrix first, which keeps the corrected feature pipeline trainable on the current GPU budget.
 
 ## Run
 

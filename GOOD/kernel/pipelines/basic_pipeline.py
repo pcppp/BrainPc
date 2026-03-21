@@ -77,11 +77,55 @@ class Pipeline:
         # 2. 特征扰动 (可选: Masking Node Features)
         x = data.x
         mask_rate = 0.1
-        mask = torch.rand(x.size()) < mask_rate
+        mask = torch.rand(x.size(), device=x.device) < mask_rate
         x[mask] = 0
         data.x = x
         
         return data
+
+    def _compute_pretrain_loss(self, data: Batch) -> torch.Tensor:
+        view1 = self.augment_graph(data.clone(), self.config)
+        view2 = self.augment_graph(data.clone(), self.config)
+
+        out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
+        out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)
+        raw_pred = (out1, out2)
+        loss = self.ood_algorithm.loss_calculate(raw_pred, None, None, None, self.config)
+        return self.ood_algorithm.loss_postprocess(loss, data, None, self.config)
+
+    def _train_pretrain_microbatches(self, data: Batch, pretrain_bs: int) -> dict:
+        graph_list = data.to_data_list()
+        total_graphs = len(graph_list)
+        self.ood_algorithm.optimizer.zero_grad()
+
+        aggregated_loss = torch.zeros((), device=self.config.device)
+        processed_graphs = 0
+
+        for start in range(0, total_graphs, pretrain_bs):
+            chunk_graphs = graph_list[start:start + pretrain_bs]
+            if len(chunk_graphs) < 2:
+                continue
+
+            chunk = Batch.from_data_list(chunk_graphs).to(self.config.device)
+            chunk_loss = self._compute_pretrain_loss(chunk)
+            chunk_weight = len(chunk_graphs) / total_graphs
+            (chunk_loss * chunk_weight).backward()
+            aggregated_loss = aggregated_loss + chunk_loss.detach() * chunk_weight
+            processed_graphs += len(chunk_graphs)
+
+            del chunk, chunk_loss
+            if self.config.device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        if processed_graphs == 0:
+            zero_loss = torch.zeros((), device=self.config.device)
+            self.ood_algorithm.mean_loss = zero_loss
+            return {'loss': zero_loss}
+
+        self.ood_algorithm.optimizer.step()
+        self.ood_algorithm.mean_loss = aggregated_loss
+        return {'loss': aggregated_loss.detach()}
+
     def train_batch(self, data: Batch, pbar) -> dict:
         r"""
         Train a batch. (Project use only)
@@ -92,10 +136,6 @@ class Pipeline:
         Returns:
             Calculated loss.
         """
-        data = data.to(self.config.device)
-
-        self.ood_algorithm.optimizer.zero_grad()
-
         # 获取当前模式 (默认 finetune 以防未设置)
         current_mode = getattr(self.ood_algorithm, 'current_mode', 'finetune')
 
@@ -103,27 +143,20 @@ class Pipeline:
         # 分支 A: 预训练模式 (Contrastive Learning)
         # ==================================================
         if current_mode == 'pretrain':
-            # 1. 数据增强：生成两个视图 (View Generation)
-            # 这里调用一个辅助函数对图进行扰动 (随机去边、掩码特征等)
-            # 注意：data 需要 clone，否则会修改原数据
-            view1 = self.augment_graph(data.clone(), self.config)
-            view2 = self.augment_graph(data.clone(), self.config)
-            
-            # 2. 前向传播：跑两次模型 (此时 model 会自动走 proj_head)
-            # 注意：不需要 edge_weight 或 targets，因为是无监督
-            out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
-            out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)
-            
-            # 3. 计算损失
-            # 将两个视图的输出打包传给 loss_calculate
-            # targets 传 None，因为是自监督
-            raw_pred = (out1, out2) 
-            loss = self.ood_algorithm.loss_calculate(raw_pred, None, None, None, self.config)
+            pretrain_bs = getattr(self.config.train, 'pretrain_bs', None)
+            if pretrain_bs and getattr(data, 'num_graphs', 1) > pretrain_bs:
+                return self._train_pretrain_microbatches(data, pretrain_bs)
+
+            data = data.to(self.config.device)
+            self.ood_algorithm.optimizer.zero_grad()
+            loss = self._compute_pretrain_loss(data)
 
         # ==================================================
         # 分支 B: 微调/分类模式 (Original Logic)
         # ==================================================
         else:
+            data = data.to(self.config.device)
+            self.ood_algorithm.optimizer.zero_grad()
             # 1. 准备标签和掩码
             mask, targets = nan2zero_get_mask(data, 'train', self.config)
             node_norm = data.get('node_norm') if self.config.model.model_level == 'node' else None
@@ -168,6 +201,8 @@ class Pipeline:
         # 第一阶段：预训练 (Pre-training)
         # ==========================================
         pretrain_epochs = getattr(self.config.train, 'pre_epoch', 50)
+        pretrain_bs = getattr(self.config.train, 'pretrain_bs', self.config.train.train_bs)
+        print(f'#IN# Pre-train effective batch size: {pretrain_bs}')
 
         for epoch in range(pretrain_epochs):
             self.config.train.epoch = epoch # 记录当前 epoch

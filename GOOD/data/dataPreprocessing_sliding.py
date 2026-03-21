@@ -66,7 +66,7 @@ def _load_fc_matrix(path: str, num_nodes: int) -> np.ndarray:
     return fc
 
 
-def _sparsify_fc_matrix(fc_matrix: np.ndarray, edge_ratio: float, topk_per_node: int = 4) -> np.ndarray:
+def _sparsify_fc_matrix(fc_matrix: np.ndarray, edge_ratio: float, topk_per_node=None) -> np.ndarray:
     num_nodes = fc_matrix.shape[0]
     if topk_per_node is not None:
         k = max(1, min(int(topk_per_node), num_nodes - 1))
@@ -111,10 +111,10 @@ def _select_node_features(node_feats: np.ndarray, fc_matrix: np.ndarray, node_fe
     raise NotImplementedError(f"Unsupported node_feat_transform: {node_feat_transform}")
 
 def construct_dataset(dataName,
-                      edge_ratio=0.1,
+                      edge_ratio=0.2,
                       node_feat_transform='timeseries',
                       use_wavelet=False,
-                      topk_per_node: int = 4):
+                      topk_per_node=None):
     """
     预处理数据集：
       - node_feat_transform='timeseries': 返回Z-score标准化后的时间序列 (N, T)，让CNN自己学习时间模式
@@ -260,8 +260,13 @@ def construct_dataset(dataName,
 if __name__ == '__main__':
     file_name_list = ['abide']
     for data_name in file_name_list:
-        # 使用 timeseries 模式：返回Z-score标准化的时间序列 (N, T)
-        # CNN将直接对时间序列做卷积，自动学习时间模式
-        # 边特征：Pearson相关系数（已在E_features中）
-        construct_dataset(data_name, node_feat_transform='timeseries', use_wavelet=True, topk_per_node=4)
+        # 对齐旧的 sliding 预处理路径：
+        # 使用 z-score 标准化后的时间序列作为节点特征，并按 edge_ratio 做边稀疏化。
+        construct_dataset(
+            data_name,
+            edge_ratio=0.2,
+            node_feat_transform='timeseries',
+            use_wavelet=False,
+            topk_per_node=None,
+        )
     print('Done!')

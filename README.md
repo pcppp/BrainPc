@@ -12,13 +12,20 @@ This repository has been adapted for local ABIDE experiments. On `feature/remove
 - All CWN and cell-complex-specific runtime inputs have been removed, including `x_0/x_1/x_2`, incidence matrices, adjacency matrices, and custom topo batching.
 - The model path no longer initializes CWN-related channel settings or TopoModelX-based code.
 - The remaining experiment flow keeps the current ABIDE dataset path and graph-level BrainOOD training stack.
-- The ABIDE preprocessing path now keeps raw node timeseries in `N_features`, reads edge connectivity from the original `*_correlation_matrix.mat`, and uses the precomputed `feat` field as the runtime node feature input.
-- The ABIDE preprocessing path now builds a sparse graph directly from the strongest FC connections per node instead of materializing the dense matrix first, which keeps the corrected feature pipeline trainable on the current GPU budget.
+- The ABIDE preprocessing path now reads node timeseries from the original `*_features_timeseries.mat` files, uses the original `*_correlation_matrix.mat` files for graph construction, and keeps the precomputed `feat` field as the runtime node feature input.
+- The current branch now prefers the older sliding/time preprocessing artifact at `GOOD/data/bin_time_dataset/abide.bin` when it exists, so experiments can reuse the earlier memory-safe preprocessing path instead of the newer `bin_dataset` output.
+- `GOOD/data/dataPreprocessing_sliding.py` is aligned with the earlier local preprocessing logic again: z-score timeseries features, `edge_ratio=0.2`, no default wavelet compression, and output written to `bin_time_dataset`.
 
 ## Run
 
 ```bash
 goodtg --config_path GOOD_configs/GOODABIDE/site/concept/BrainOOD.yaml
+```
+
+For this feature branch on the shared server, prefer running from the repo root so the current checkout is used instead of an older installed console script:
+
+```bash
+PYTHONPATH=$PWD python -m GOOD.kernel.main --config_path GOOD_configs/GOODABIDE/site/concept/BrainOOD.yaml
 ```
 
 ## Contact

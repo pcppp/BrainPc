@@ -155,9 +155,18 @@ class GOODABIDE(InMemoryDataset):
             meta_json = json.load(f)
         
        
-        # G_dataset, Labels = load_graphs('./GOOD/data/bin_gb_dataset/abide_gb.bin')
-        G_dataset, Labels = load_graphs('./GOOD/data/bin_dataset/abide.bin')
-        # G_dataset, Labels = load_graphs('./GOOD/data/bin_dataset/abide.bin')
+        dataset_candidates = [
+            './GOOD/data/bin_time_dataset/abide.bin',
+            './GOOD/data/bin_dataset/abide.bin',
+        ]
+        dataset_path = next((path for path in dataset_candidates if osp.exists(path)), None)
+        if dataset_path is None:
+            raise FileNotFoundError(
+                'ABIDE bin file not found. Expected one of: '
+                + ', '.join(dataset_candidates)
+            )
+        print(f'#IN#Loading ABIDE graphs from {dataset_path}')
+        G_dataset, Labels = load_graphs(dataset_path)
 
 
         error_case = []

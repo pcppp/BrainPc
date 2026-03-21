@@ -6,7 +6,6 @@ import dgl
 import networkx as nx
 from tqdm import tqdm
 from dgl.data.utils import save_graphs
-import toponetx as tnx
 BASEDIR = 'GOOD/data'
 # ---------------------------------------------------------------------------------------------
 def _key_from_path(p: str) -> str:

@@ -22,8 +22,6 @@ from GOOD.utils.config_reader import CommonArgs, Munch, process_configs
 from GOOD.utils.initial import reset_random_seed
 # from GOOD.utils.logger import load_logger
 from GOOD.definitions import OOM_CODE
-from GOOD.utils.data.utils import convert_graph_dataset_with_rings
-import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 from GOOD.utils.visualize_tsne import extract_embeddings, plot_tsne_comparison
 
@@ -44,12 +42,6 @@ def initialize_model_dataset(config: Union[CommonArgs, Munch], fold: int = 0) ->
         print(f'#IN#Load Dataset {config.dataset.dataset_name}')
 
         dataset = load_dataset(config.dataset.dataset_name, config, fold)
-        # sample_data = dataset['train'][0]
-        
-        config.dataset.in_channels_0 = 100
-        config.dataset.in_channels_1 = 1
-        config.dataset.in_channels_2 = 100
-        
         loader = create_dataloader(dataset, config)
 
         # Load model

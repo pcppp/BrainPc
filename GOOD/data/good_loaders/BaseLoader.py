@@ -11,8 +11,6 @@ from torch_geometric.data.dataset import Dataset
 import numpy as np
 import torch
 
-from torch_geometric.data.batch import Batch
-
 @register.dataloader_register
 class BaseDataLoader(Munch):
 
@@ -68,18 +66,4 @@ class BaseDataLoader(Munch):
                           'id_test') else None,
                       'val': DataLoader(dataset['val'], batch_size=config.train.val_bs, shuffle=False, num_workers=config.num_workers, worker_init_fn=seed_worker, generator=g),
                       'test': DataLoader(dataset['test'], batch_size=config.train.test_bs, shuffle=False, num_workers=config.num_workers, worker_init_fn=seed_worker, generator=g)}
-
         return cls(loader)
-    def custom_collate_fn(data_list):
-        batch = Batch.from_data_list(data_list)
-
-        # 拼接 x_1
-        batch.x_1 = torch.cat([data.x_1 for data in data_list], dim=0)
-        batch.x_2 = torch.cat([data.x_2 for data in data_list], dim=0)
-        
-        # 拼接 incidence 和 adjacency
-        batch.incidence_1_t = torch.block_diag(*[data.incidence_1_t for data in data_list])
-        batch.incidence_2 = torch.block_diag(*[data.incidence_2 for data in data_list])
-        batch.adjacency = torch.block_diag(*[data.adjacency for data in data_list])
-        
-        return batch

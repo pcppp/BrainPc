@@ -48,45 +48,36 @@ class GNNBasic(torch.nn.Module):
             if not args:
                 assert 'x' in kwargs
                 assert 'edge_index' in kwargs
-                x, edge_index = kwargs['x'], kwargs['edge_index'],
+                x, edge_index = kwargs['x'], kwargs['edge_index']
                 batch = kwargs.get('batch')
+                edge_weight = kwargs.get('edge_weight')
                 if batch is None:
                     batch = torch.zeros(kwargs['x'].shape[0], dtype=torch.int64, device=torch.device('cuda'))
             elif len(args) == 2:
                 x, edge_index, batch = args[0], args[1], \
                                        torch.zeros(args[0].shape[0], dtype=torch.int64, device=torch.device('cuda'))
+                edge_weight = kwargs.get('edge_weight')
             elif len(args) == 3:
                 x, edge_index, batch = args[0], args[1], args[2]
+                edge_weight = kwargs.get('edge_weight')
             else:
                 raise ValueError(f"forward's args should take 2 or 3 arguments but got {len(args)}")
         else:
-            x, edge_index, edge_weight,batch = data.x, data.edge_index,data.edge_weight, data.batch
-
-            # 检查是否有拓扑特征，挂载默认值或报错
-            ball_id = getattr(data, 'ball_id', None)
-            x_0 = getattr(data, 'x_0', None)
-            x_1 = getattr(data, 'x_1', None)
-            x_2 = getattr(data, 'x_2', None)
-            in_channels_0 = 100
-            in_channels_1 = 1
-            in_channels_2 = 100
-            # print('-----------------------@',in_channels_0)
-            # print(in_channels_1)
-            # print(in_channels_2)
-            adjacency_1 = getattr(data, 'adjacency', None)
-            incidence_2 = getattr(data, 'incidence_2', None)
-            incidence_1_t = getattr(data, 'incidence_1_t', None)
+            x, edge_index, batch = data.x, data.edge_index, data.batch
+            edge_weight = getattr(data, 'edge_weight', kwargs.get('edge_weight'))
         if self.config.model.model_level != 'node':
             # --- Maybe batch size --- Reason: some method may filter graphs leading inconsistent of batch size
             batch_size: int = kwargs.get('batch_size') or (batch[-1].item() + 1)
 
-        if edge_weight != None:
+        if self.config.model.model_level == 'node':
+            return x, edge_index, edge_weight, batch
+        if edge_weight is not None:
             return x, edge_index, edge_weight, batch, batch_size
-        elif self.config.dataset.dim_edge:
+        if self.config.dataset.dim_edge:
             edge_attr = data.edge_attr
             return x, edge_index, edge_attr, batch, batch_size
 
-        return x, edge_index, batch, batch_size,x_0,x_1,x_2,adjacency_1,incidence_2,incidence_1_t,ball_id
+        return x, edge_index, batch, batch_size
 
     def probs(self, *args, **kwargs):
         # nodes x classes

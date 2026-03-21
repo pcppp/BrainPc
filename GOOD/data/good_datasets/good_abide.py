@@ -2,9 +2,7 @@
 The GOOD-HIV dataset adapted from `MoleculeNet
 <https://pubs.rsc.org/en/content/articlehtml/2018/sc/c7sc02664a>`_.
 """
-from topomodelx.utils.sparse import from_sparse
 import itertools
-import networkx as nx
 import os
 import os.path as osp
 import random
@@ -21,8 +19,6 @@ from torch_geometric.datasets import MoleculeNet
 from tqdm import tqdm
 import csv
 import json
-import toponetx as tnx
-from GOOD.utils.data.utils import convert_graph_dataset_with_rings,compute_ring_2complex, get_rings
 
 class DomainGetter():
     r"""
@@ -278,70 +274,11 @@ def get_all_split_idx(name):
 
 
 def dgl_to_pyg(graph, y, domain):
-    # cell --complexes
-    # x = graph.ndata['N_features'].float()
-    
-    # edge_attr = graph.edata['feat'].float()
-    # edge_index = torch.stack(graph.edges()).contiguous()
-    # yy = torch.zeros(1, 2)
-    # yy[0][y] = 1
-
-    # return complex_to_pyg_data(graph = graph,x=x ,label=yy, domain=domain,edge_index=edge_index,edge_attr=edge_attr)
-    # origin 
     x = graph.ndata['feat']
     edge_index = torch.stack(graph.edges()).contiguous()
-    edge_weight= graph.edata['feat'].float() 
-    yy = torch.zeros(1,2)
+    edge_weight = graph.edata['feat'].float()
+    yy = torch.zeros(1, 2)
     yy[0][y] = 1
-    # Create a PyG Data object
-    data = Data(x=x.float(), edge_index=edge_index,edge_weight = edge_weight ,y=yy,domain=domain)
+    data = Data(x=x.float(), edge_index=edge_index, edge_weight=edge_weight, y=yy, domain=domain)
     data.env_id = domain
-    # print(data.edge_index.size())
     return data
-def complex_to_pyg_data(graph, x,label=None ,domain=None,edge_index=None,edge_attr=None):
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    complex = graph.complexes
-    coch0 = x
-    coch1 = complex.cochains[1].x
-    coch2 = complex.cochains[2].x
-    # G = nx.Graph()
-    # G.add_edges_from(edge_index.T.tolist())
-    # cell_complex = tnx.CellComplex(G)
-    # cycles = get_rings(edge_index, max_k=4)
-    # cell_complex.add_cells_from(cycles, rank=2)
-
-
-
-    # adjacency_1 = cell_complex.adjacency_matrix(rank=1)
-    # incidence_1_t = cell_complex.incidence_matrix(rank=1).T
-    # incidence_2 = cell_complex.incidence_matrix(rank=2)
-
-    incidence_2 = complex.incidence_2
-    adjacency_1 = complex.adjacency_1
-    incidence_1_t = complex.incidence_1_t
-    # 构建 edge_index
-    # boundary_index = coch1.boundary_index
-    # edge_ids = boundary_index[0]
-    # node_ids = boundary_index[1]
-    # num_edges = edge_ids.max().item() + 1
-    # edge_index = torch.zeros((2, num_edges), dtype=torch.long)
-    # for i in range(num_edges):
-    #     nodes = node_ids[edge_ids == i]
-    #     if len(nodes) == 2:
-    #         edge_index[:, i] = nodes
-
-    # 构建 PyG Data 对象，三种特征分开挂载
-    data = Data(x=x,edge_index=edge_index, y=label)
-    if 'ball_id' in graph.ndata:
-        data.ball_id = graph.ndata['ball_id'].long()   # [num_nodes]
-    data.env_id = domain
-
-    data.x_0 = coch0
-    data.x_1 = coch1
-    data.x_2 = coch2
-
-    data.adjacency = adjacency_1
-    data.incidence_1_t = incidence_1_t
-    data.incidence_2 = incidence_2
-    return data
-

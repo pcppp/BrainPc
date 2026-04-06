@@ -82,7 +82,6 @@ def gb_division(data, args):
 
     # 删除孤立点
     graph = del_outlier.del_outlier(graph)
-    print("len(node)", len(graph.nodes()))
 
     # 记录粒球生成时间
     total_time = 0
@@ -197,7 +196,6 @@ def gb_division(data, args):
     
     # for C in new_C:
     #     print("合并完粒球纯度：", C[-1])
-    print("分完--------------------------------------------")
     #print("new C", new_C)
     #print("提纯前", len(new_C))
     # 提纯球簇并加标签
@@ -206,7 +204,6 @@ def gb_division(data, args):
     #end = time.perf_counter()
     #print("提纯时间：", end-start)
     #print("提纯后", len(new_C))  #[[oldid,特征，标签，newid], 度序列, 纯度, 标签]
-    print("粒球数", len(new_C))  #[[oldid,特征，标签，newid], 度序列, 纯度, 标签]
 
 
     #计算粒球特征平均
@@ -254,24 +251,9 @@ def gb_division(data, args):
         return data
 
 
-    # 显示图的信息
-    def display_graph_info(graph):
-        print("图的信息：")
-        print("节点数：", graph.number_of_nodes())
-        print("边数：", graph.number_of_edges())
-        print("平均度：", sum(dict(graph.degree()).values()) / graph.number_of_nodes())
-        # 还可以添加更多信息
-
-    # 在您的函数或脚本中 调用这些函数
-    display_graph_info(GB_graph)
-
-
     end_time4 = time.perf_counter()
     #print("后续操作：", end_time4-start_time4, "秒")
     total_time += end_time4-start_time4
-    print("总时间：", total_time, "秒")
-
-
     return new_f,new_C,total_time  # 返回处理后的数据
 
 

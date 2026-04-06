@@ -10,7 +10,6 @@ import networkx as nx
 def initial_splite(C, graph, id_dict, id_dict_oldtonew, labels, total_degree_dict):
 
     connected_components = list(nx.connected_components(graph))
-    print("连通数",len(connected_components))
     new_clusters = [] #存储每个连通分支的粒球
     for i, component in enumerate(connected_components, start=1):
         #print("连通", i ,list(component))

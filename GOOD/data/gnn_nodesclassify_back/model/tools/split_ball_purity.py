@@ -110,7 +110,6 @@ def split_ball_purity(graph, id_dict, C_queue, C, labels, total_degree_dict, tot
 #非递归二分裂
 def split_ball_purity_unrRcursion(graph, id_dict, C, total_degree_dict, total_balls_num, purity_threshold=1):
     cur_ball_num = len(C)
-    print("粗分球：", cur_ball_num)
     while True:
         # 对粒球按照类别数排序
         # C.sort(key=lambda x: len(x[0])*(1-x[-1]), reverse=True) #考虑纯度和大小
@@ -139,7 +138,6 @@ def split_ball_purity_unrRcursion(graph, id_dict, C, total_degree_dict, total_ba
 #再次二分裂
 def split_ball_further(graph, id_dict, C, total_degree_dict, total_balls_num,purity_threshold=1.0):
     cur_ball_num = len(C)
-    print("第er次二分裂的球：",cur_ball_num)
 
     while True:
         if cur_ball_num >= total_balls_num:

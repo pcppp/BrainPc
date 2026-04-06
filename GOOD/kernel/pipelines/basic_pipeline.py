@@ -178,22 +178,28 @@ class Pipeline:
 
         for epoch in range(pretrain_epochs):
             self.config.train.epoch = epoch # 记录当前 epoch
-            
-            # ... (此处保留原本的进度条和 loop 代码，但略作简化) ...
             mean_loss = 0
+            processed_steps = 0
             self.ood_algorithm.stage_control(self.config) # 某些动态调整
 
-            for index, data in enumerate(self.loader['train']):
+            pbar = tqdm(
+                enumerate(self.loader['train']),
+                total=len(self.loader['train']),
+                desc=f'Pretrain {epoch + 1}/{pretrain_epochs}',
+                leave=False,
+            )
+            for index, data in pbar:
                 if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
                     continue
-                
-                # 注意：预训练通常不需要 DANN 的 alpha 参数，或者 alpha 策略不同
-                # 如果对比学习也是跨域的，可以保留 alpha 计算
-                
-                # train_batch 内部需要根据 current_stage 判断是用 Contrastive Loss 还是 CrossEntropy
-                train_stat = self.train_batch(data, None) 
-                mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
-            
+
+                train_stat = self.train_batch(data, None)
+                processed_steps += 1
+                mean_loss = (mean_loss * (processed_steps - 1) + self.ood_algorithm.mean_loss) / processed_steps
+                try:
+                    pbar.set_postfix(loss=f'{float(mean_loss):.4f}')
+                except Exception:
+                    pass
+
             print(f'#IN# Pre-train Epoch {epoch}: Contrastive Loss {mean_loss:.4f}')
             
             # 预训练阶段通常不需要频繁做完整的 val/test 评估，或者只看 loss 即可

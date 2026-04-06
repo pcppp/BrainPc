@@ -44,48 +44,20 @@ class Pipeline:
         self.loader: Union[DataLoader, Dict[str, DataLoader]] = loader
         self.ood_algorithm: BaseOODAlg = ood_algorithm
         self.config: Union[CommonArgs, Munch] = config
-    # --- 辅助函数：图数据增强 ---
-    # 你可以把它放在类里，或者 utils 里
-    def augment_graph(self, data, config):
-        """
-        简单的图增强示例：随机丢弃边 (Edge Dropping)
-        """
-        import torch_geometric.transforms as T
-        from torch_geometric.utils import dropout_edge
+    def build_contrastive_views(self, data: Batch):
+        from GOOD.data.gb import build_granular_ball_view
 
-        # 这里的 p 是丢弃边的概率，可以在 config 里设置
-        aug_prob = getattr(config.train, 'aug_prob', 0.2) 
-        
-        # 1. 边扰动
-        edge_index, edge_mask = dropout_edge(data.edge_index, p=aug_prob, training=True)
-        data.edge_index = edge_index
-        
-        # 2. 【关键修正】如果 data 里有 edge_weight 或 edge_attr，必须用 edge_mask 同步筛选
-        if hasattr(data, 'edge_weight') and data.edge_weight is not None:
-            # 只有当 edge_weight 和 edge_index 长度一致时才筛选 (防止有些 edge_weight 是空的或者形状不同)
-            if data.edge_weight.size(0) == edge_mask.size(0):
-                data.edge_weight = data.edge_weight[edge_mask]
-                
-        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
-             if data.edge_attr.size(0) == edge_mask.size(0):
-                data.edge_attr = data.edge_attr[edge_mask]
-        
-        # 3. 如果有 edge_norm (有些 GNN 实现会用这个名字)，也处理一下
-        if hasattr(data, 'edge_norm') and data.edge_norm is not None:
-             if data.edge_norm.size(0) == edge_mask.size(0):
-                data.edge_norm = data.edge_norm[edge_mask]
-        # 2. 特征扰动 (可选: Masking Node Features)
-        x = data.x
-        mask_rate = 0.1
-        mask = torch.rand(x.size(), device=x.device) < mask_rate
-        x[mask] = 0
-        data.x = x
-        
-        return data
+        graph_list = data.to_data_list()
+        original_graphs = [graph.clone() for graph in graph_list]
+        ball_r = getattr(self.config.train, 'ball_r', 0.5)
+        coarse_graphs = [build_granular_ball_view(graph, ball_r=ball_r) for graph in graph_list]
+
+        view1 = Batch.from_data_list(original_graphs).to(self.config.device)
+        view2 = Batch.from_data_list(coarse_graphs).to(self.config.device)
+        return view1, view2
 
     def _compute_pretrain_loss(self, data: Batch) -> torch.Tensor:
-        view1 = self.augment_graph(data.clone(), self.config)
-        view2 = self.augment_graph(data.clone(), self.config)
+        view1, view2 = self.build_contrastive_views(data)
 
         out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
         out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)

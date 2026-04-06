@@ -1,80 +1,102 @@
-def apply_gb_coarsening_to_dgl(g_dgl, label, ball_r=0.5):
+from types import SimpleNamespace
+
+import torch
+from torch_geometric.data import Data
+
+
+def _graph_label_to_int(y: torch.Tensor) -> int:
+    if y is None:
+        return 0
+    if y.dim() == 0:
+        return int(y.item())
+    if y.dim() == 1:
+        if y.numel() == 1:
+            return int(y.item())
+        return int(y.argmax().item())
+    return int(y.view(y.size(0), -1)[0].argmax(dim=-1).item())
+
+
+def _fallback_graph_view(data: Data) -> Data:
+    view = data.clone()
+    view.x = data.x.clone().float()
+    view.edge_index = data.edge_index.clone().long()
+    if getattr(data, 'edge_weight', None) is not None:
+        view.edge_weight = data.edge_weight.clone().float()
+    if getattr(data, 'edge_attr', None) is not None:
+        view.edge_attr = data.edge_attr.clone().float()
+    if getattr(data, 'y', None) is not None:
+        view.y = data.y.clone()
+    if hasattr(data, 'domain'):
+        view.domain = data.domain
+    if hasattr(data, 'env_id'):
+        view.env_id = data.env_id
+    return view
+
+
+def build_granular_ball_view(data: Data, ball_r: float = 0.5) -> Data:
+    """Build a coarse PyG graph view using granular-ball division.
+
+    The returned graph keeps the original feature dimension so it can serve as a
+    semantically aligned positive view for cross-scale contrastive learning.
     """
-    对单个 DGL 图应用粒球粗化（修复版）
-    
-    Args:
-        g_dgl: DGL图对象，包含 ndata['feat'] 和 edata['E_features']
-        label: 图标签 (int)
-        ball_r: 粗化比例
-    
-    Returns:
-        粗化后的 DGL 图 (粒球作为节点)
-    """
-    from torch_geometric.data import Data
-    import torch
-    import dgl
-    import numpy as np
-    
-    # 1️⃣ DGL 转 PyG (gb_division 需要)
-    x = g_dgl.ndata['feat'].clone()  # (N, feat_dim)
-    edge_index = torch.stack(g_dgl.edges(), dim=0)  # (2, E)
-    
-    # 构造 PyG Data
-    y_tensor = torch.zeros(x.shape[0], dtype=torch.long)
-    y_tensor.fill_(label)  # 所有节点标签一致
-    
-    pyg_data = Data(x=x, edge_index=edge_index, y=y_tensor)
-    pyg_data.test_mask = torch.zeros(x.shape[0], dtype=torch.bool)  # gb_division 需要
-    
-    # 2️⃣ 调用粒球划分
+    if data.x is None or data.x.size(0) <= 1 or data.edge_index is None or data.edge_index.numel() == 0:
+        return _fallback_graph_view(data)
+
     try:
-        from gb_division import gb_division
-        args = GBArgs(ball_r=ball_r, noisy=0)
-        gb_result, gb_list, _ = gb_division(pyg_data, args)
-    except Exception as e:
-        print(f"⚠️ 粒球划分失败，跳过粗化: {e}")
-        import traceback
-        traceback.print_exc()
-        return g_dgl  # 返回原图
-    
-    # 3️⃣ 提取粒球特征和边
-    gb_features_avg = torch.tensor(gb_result['gb_features'], dtype=torch.float32)  # (num_balls, old_feat_dim)
-    gb_adj = torch.tensor(gb_result['adj'], dtype=torch.long)  # (2, num_ball_edges)
-    
-    num_balls = gb_features_avg.shape[0]
-    
-    # 🔧 关键修复：重新计算粒球之间的Pearson相关性
-    # gb_features_avg 是 (num_balls, old_feat_dim)，比如 (20, 100)
-    # 我们需要计算粒球之间的相关性，得到 (num_balls, num_balls)，比如 (20, 20)
-    
-    if num_balls > 1:
-        # 计算粒球之间的Pearson相关系数
-        gb_features_np = gb_features_avg.cpu().numpy()  # (num_balls, old_feat_dim)
-        gb_corr = np.corrcoef(gb_features_np, rowvar=True).astype(np.float32)  # (num_balls, num_balls)
-        gb_features = torch.from_numpy(gb_corr)
-        print(f"  ✓ 粒球特征: {gb_features_avg.shape} → {gb_features.shape} (重新计算Pearson相关性)")
+        from GOOD.data.gnn_nodesclassify_back.gb_division import gb_division
+    except Exception as exc:
+        print(f"⚠️ Failed to import granular-ball builder, fallback to original view: {exc}")
+        return _fallback_graph_view(data)
+
+    graph_label = _graph_label_to_int(getattr(data, 'y', None))
+    num_nodes = int(data.x.size(0))
+    work_data = Data(
+        x=data.x.detach().cpu().float(),
+        edge_index=data.edge_index.detach().cpu().long(),
+        y=torch.full((num_nodes,), graph_label, dtype=torch.long),
+        test_mask=torch.zeros(num_nodes, dtype=torch.bool),
+    )
+
+    args = SimpleNamespace(ball_r=ball_r, noisy=0)
+
+    try:
+        gb_result, _, _ = gb_division(work_data, args)
+    except Exception as exc:
+        print(f"⚠️ Granular-ball division failed, fallback to original view: {exc}")
+        return _fallback_graph_view(data)
+
+    gb_features = torch.as_tensor(gb_result.get('gb_features'), dtype=torch.float32)
+    gb_adj = torch.as_tensor(gb_result.get('adj'), dtype=torch.long)
+
+    if gb_features.ndim == 1:
+        gb_features = gb_features.unsqueeze(0)
+
+    if gb_features.numel() == 0 or gb_features.size(0) == 0:
+        return _fallback_graph_view(data)
+
+    num_balls = int(gb_features.size(0))
+    if gb_adj.numel() == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
     else:
-        # 只有1个粒球时，特征就是它自己与自己的相关性(=1)
-        gb_features = torch.ones((1, 1), dtype=torch.float32)
-        print(f"  ⚠️ 只有1个粒球，特征设为 [1]")
-    
-    # 4️⃣ 创建新的 DGL 图 (粒球图)
-    if gb_adj.shape[1] > 0:
-        g_coarsened = dgl.graph((gb_adj[0], gb_adj[1]), num_nodes=num_balls)
+        edge_index = gb_adj.view(2, -1).long()
+
+    if edge_index.numel() > 0:
+        edge_weight = torch.ones(edge_index.size(1), 1, dtype=torch.float32)
     else:
-        g_coarsened = dgl.graph(([], []), num_nodes=num_balls)
-    
-    # 5️⃣ 设置粒球特征 (保持字段名一致)
-    g_coarsened.ndata['feat'] = gb_features  # (num_balls, num_balls)
-    g_coarsened.ndata['N_features'] = gb_features
-    
-    # 6️⃣ 设置边特征 (简单设为1，因为gb_division不处理边特征)
-    if g_coarsened.num_edges() > 0:
-        g_coarsened.edata['E_features'] = torch.ones(g_coarsened.num_edges(), dtype=torch.float32)
-        g_coarsened.edata['feat'] = g_coarsened.edata['E_features'].unsqueeze(-1)
-    
-    # 打印粗化信息
-    if g_dgl.num_nodes() != num_balls:
-        print(f"  ✓ {g_dgl.num_nodes()}节点 → {num_balls}粒球 (边: {g_dgl.num_edges()}→{g_coarsened.num_edges()})")
-    
-    return g_coarsened
+        edge_weight = torch.empty((0, 1), dtype=torch.float32)
+
+    coarse = Data(
+        x=gb_features,
+        edge_index=edge_index,
+        edge_weight=edge_weight,
+        y=data.y.clone() if getattr(data, 'y', None) is not None else None,
+    )
+    coarse.edge_attr = edge_weight
+    coarse.num_nodes = num_balls
+
+    if hasattr(data, 'domain'):
+        coarse.domain = data.domain
+    if hasattr(data, 'env_id'):
+        coarse.env_id = data.env_id
+
+    return coarse

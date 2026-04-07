@@ -153,13 +153,13 @@ class BaseOODAlg(ABC):
 
         """
         if self.current_mode == 'pretrain':
-            # 预训练模式：计算对比学习损失 (InfoNCE / NT-Xent)
-            # raw_pred 应该是 (z1, z2) 元组，包含两个视图的投影表示
-            temperature = getattr(config.ood, 'temperature', 0.01)
-            # 传入标签以支持监督对比学习
+            # 有标签时用监督对比学习 (SupCon, temp=0.07)，否则用自监督 (SimCLR, temp=0.1)
+            # 脑网络任务标签可靠，优先走监督路径以获得更强的类别区分信号
+            if targets is not None:
+                temperature = getattr(config.ood, 'temperature', 0.07)
+            else:
+                temperature = getattr(config.ood, 'temperature', 0.10)
             contrastive_loss = self.calculate_contrastive_loss(raw_pred, temperature, labels=targets)
-            
-            # 返回标量损失（与 finetune 模式在 loss_postprocess 中处理方式一致）
             return contrastive_loss
 
         # === 模式 B: 微调 / 正常训练 (分类) ===
@@ -251,66 +251,40 @@ class BaseOODAlg(ABC):
         return loss
         
 
-def calculate_embedding_regularizer(self, features, variance_weight: float = 0.5, covariance_weight: float = 0.05):
-    z1, z2 = features
-    if isinstance(z1, (tuple, list)):
-        z1 = z1[0]
-    if isinstance(z2, (tuple, list)):
-        z2 = z2[0]
+    def calculate_embedding_regularizer(self, features, variance_weight: float = 0.5, covariance_weight: float = 0.05):
+        z1, z2 = features
+        if isinstance(z1, (tuple, list)):
+            z1 = z1[0]
+        if isinstance(z2, (tuple, list)):
+            z2 = z2[0]
 
-    def _variance_term(z):
-        if z.size(0) < 2:
-            return torch.zeros((), device=z.device)
-        std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
-        return torch.relu(1.0 - std).mean()
+        def _variance_term(z):
+            if z.size(0) < 2:
+                return torch.zeros((), device=z.device)
+            std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
+            return torch.relu(1.0 - std).mean()
 
-    def _covariance_term(z):
-        if z.size(0) < 2:
-            return torch.zeros((), device=z.device)
-        z = z - z.mean(dim=0, keepdim=True)
-        cov = (z.T @ z) / max(z.size(0) - 1, 1)
-        off_diag = cov - torch.diag(torch.diag(cov))
-        return off_diag.pow(2).sum() / z.size(1)
+        def _covariance_term(z):
+            if z.size(0) < 2:
+                return torch.zeros((), device=z.device)
+            z = z - z.mean(dim=0, keepdim=True)
+            cov = (z.T @ z) / max(z.size(0) - 1, 1)
+            off_diag = cov - torch.diag(torch.diag(cov))
+            return off_diag.pow(2).sum() / z.size(1)
 
-    var_loss = _variance_term(z1) + _variance_term(z2)
-    cov_loss = _covariance_term(z1) + _covariance_term(z2)
-    return variance_weight * var_loss + covariance_weight * cov_loss
+        var_loss = _variance_term(z1) + _variance_term(z2)
+        cov_loss = _covariance_term(z1) + _covariance_term(z2)
+        return variance_weight * var_loss + covariance_weight * cov_loss
 
     def loss_postprocess(self, loss: Tensor, data: Batch, mask: Tensor, config: Union[CommonArgs, Munch], **kwargs) -> Tensor:
-        r"""
-        Process loss
-
-        Args:
-            loss (Tensor): base loss between model predictions and input labels
-            data (Batch): input data
-            mask (Tensor): NAN masks for data formats
-            config (Union[CommonArgs, Munch]): munchified dictionary of args
-
-        Returns (Tensor):
-            processed loss
-
-        """
         if self.current_mode == 'pretrain':
-            # 预训练模式：loss 已经是标量，直接返回
             self.mean_loss = loss
             return self.mean_loss
         else:
-            # 微调/分类模式：原有逻辑
             self.mean_loss = loss.sum() / mask.sum()
             return self.mean_loss
 
     def set_up(self, model: torch.nn.Module, config: Union[CommonArgs, Munch]):
-        r"""
-        Training setup of optimizer and scheduler
-
-        Args:
-            model (torch.nn.Module): model for setup
-            config (Union[CommonArgs, Munch]): munchified dictionary of args (:obj:`config.train.lr`, :obj:`config.metric`, :obj:`config.train.mile_stones`)
-
-        Returns:
-            None
-
-        """
         self.model: torch.nn.Module = model
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.train.lr,
                                           weight_decay=config.train.weight_decay)
@@ -318,11 +292,5 @@ def calculate_embedding_regularizer(self, features, variance_weight: float = 0.5
                                                               gamma=0.1)
 
     def backward(self, loss):
-        r"""
-        Gradient backward process and parameter update.
-
-        Args:
-            loss: target loss
-        """
         loss.backward()
         self.optimizer.step()

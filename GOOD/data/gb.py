@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 import torch
 from torch_geometric.data import Data
 
@@ -31,12 +29,13 @@ def _zscore(x: torch.Tensor) -> torch.Tensor:
 
 
 def _build_structural_feature(edge_index: torch.Tensor, edge_weight: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    device = edge_index.device
     src, dst = edge_index
-    degree = torch.zeros(num_nodes, dtype=torch.float32)
+    degree = torch.zeros(num_nodes, dtype=torch.float32, device=device)
     degree.index_add_(0, src, edge_weight.abs())
     degree.index_add_(0, dst, edge_weight.abs())
 
-    binary_degree = torch.zeros(num_nodes, dtype=torch.float32)
+    binary_degree = torch.zeros(num_nodes, dtype=torch.float32, device=device)
     ones = torch.ones_like(src, dtype=torch.float32)
     binary_degree.index_add_(0, src, ones)
     binary_degree.index_add_(0, dst, ones)
@@ -61,18 +60,19 @@ def _select_seed_indices(node_repr: torch.Tensor, seed_count: int, degree_score:
         next_dist = torch.cdist(node_repr[next_seed:next_seed + 1], node_repr).squeeze(0)
         min_dist = torch.minimum(min_dist.clamp_min(0), next_dist)
 
-    return torch.tensor(selected, dtype=torch.long)
+    return torch.tensor(selected, dtype=torch.long, device=node_repr.device)
 
 
 def _build_hop_distance(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    # 在 edge_index 所在设备上运行 Floyd-Warshall，避免 GPU↔CPU 传输开销
+    device = edge_index.device
     inf = num_nodes + 1
-    hop = torch.full((num_nodes, num_nodes), float(inf), dtype=torch.float32)
+    hop = torch.full((num_nodes, num_nodes), float(inf), dtype=torch.float32, device=device)
     hop.fill_diagonal_(0.0)
     src, dst = edge_index
     hop[src, dst] = 1.0
     hop[dst, src] = 1.0
 
-    # Floyd-Warshall is acceptable here because ABIDE graphs are only 100 nodes.
     for k in range(num_nodes):
         hop = torch.minimum(hop, hop[:, k:k + 1] + hop[k:k + 1, :])
 
@@ -86,12 +86,13 @@ def _cluster_nodes(data: Data, ball_r: float) -> tuple[torch.Tensor, int]:
     num_nodes = int(data.x.size(0))
     target_balls = max(2, min(num_nodes - 1, int(round(max(ball_r, 0.05) * num_nodes))))
 
+    device = data.x.device
     edge_weight = getattr(data, 'edge_weight', None)
     if edge_weight is None:
-        edge_weight = torch.ones(data.edge_index.size(1), dtype=torch.float32, device=data.x.device)
-    edge_weight = edge_weight.view(-1).float().cpu()
-    edge_index = data.edge_index.long().cpu()
-    x = data.x.float().cpu()
+        edge_weight = torch.ones(data.edge_index.size(1), dtype=torch.float32, device=device)
+    edge_weight = edge_weight.view(-1).float().to(device)
+    edge_index = data.edge_index.long().to(device)
+    x = data.x.float().to(device)
 
     structural = _build_structural_feature(edge_index, edge_weight, num_nodes)
     node_repr = torch.cat([_zscore(x), 0.5 * structural], dim=-1)
@@ -105,44 +106,48 @@ def _cluster_nodes(data: Data, ball_r: float) -> tuple[torch.Tensor, int]:
 
 
 def _aggregate_coarse_graph(data: Data, cluster_assign: torch.Tensor, target_balls: int) -> Data:
-    x = data.x.float().cpu()
-    num_nodes = int(x.size(0))
+    device = cluster_assign.device
+    x = data.x.float().to(device)
     num_balls = int(cluster_assign.max().item()) + 1
     num_balls = max(1, min(num_balls, target_balls))
 
-    coarse_x = torch.zeros(num_balls, x.size(1), dtype=torch.float32)
+    coarse_x = torch.zeros(num_balls, x.size(1), dtype=torch.float32, device=device)
     counts = torch.bincount(cluster_assign, minlength=num_balls).float().clamp_min(1.0)
     coarse_x.index_add_(0, cluster_assign, x)
     coarse_x = coarse_x / counts.unsqueeze(-1)
 
     edge_weight = getattr(data, 'edge_weight', None)
     if edge_weight is None:
-        edge_weight = torch.ones(data.edge_index.size(1), dtype=torch.float32)
-    edge_weight = edge_weight.view(-1).float().cpu()
-    edge_index = data.edge_index.long().cpu()
+        edge_weight = torch.ones(data.edge_index.size(1), dtype=torch.float32, device=device)
+    edge_weight = edge_weight.view(-1).float().to(device)
+    edge_index = data.edge_index.long().to(device)
 
-    pair_sum = defaultdict(float)
-    pair_count = defaultdict(int)
-    src_cluster = cluster_assign[edge_index[0]]
-    dst_cluster = cluster_assign[edge_index[1]]
-    for idx in range(edge_index.size(1)):
-        u = int(src_cluster[idx].item())
-        v = int(dst_cluster[idx].item())
-        if u == v:
-            continue
-        key = (u, v)
-        pair_sum[key] += float(edge_weight[idx].item())
-        pair_count[key] += 1
+    # 向量化边聚合，避免每条边的 .item() GPU→CPU 同步
+    src_c = cluster_assign[edge_index[0]]
+    dst_c = cluster_assign[edge_index[1]]
+    cross_mask = src_c != dst_c
 
-    if pair_sum:
-        edge_pairs = sorted(pair_sum.keys())
-        coarse_edge_index = torch.tensor(edge_pairs, dtype=torch.long).t().contiguous()
-        coarse_edge_weight = torch.tensor([
-            pair_sum[key] / max(pair_count[key], 1) for key in edge_pairs
-        ], dtype=torch.float32).unsqueeze(-1)
+    if cross_mask.any():
+        s = src_c[cross_mask]
+        d = dst_c[cross_mask]
+        w = edge_weight[cross_mask]
+
+        edge_key = s * num_balls + d
+        unique_keys, inverse = torch.unique(edge_key, return_inverse=True)
+
+        weight_sum = torch.zeros(unique_keys.size(0), device=device)
+        count = torch.zeros(unique_keys.size(0), device=device)
+        weight_sum.scatter_add_(0, inverse, w)
+        count.scatter_add_(0, inverse, torch.ones_like(w))
+        avg_weight = weight_sum / count.clamp_min(1.0)
+
+        coarse_src = unique_keys // num_balls
+        coarse_dst = unique_keys % num_balls
+        coarse_edge_index = torch.stack([coarse_src, coarse_dst], dim=0)
+        coarse_edge_weight = avg_weight.unsqueeze(-1)
     else:
-        coarse_edge_index = torch.empty((2, 0), dtype=torch.long)
-        coarse_edge_weight = torch.empty((0, 1), dtype=torch.float32)
+        coarse_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        coarse_edge_weight = torch.empty((0, 1), dtype=torch.float32, device=device)
 
     coarse = Data(
         x=coarse_x,

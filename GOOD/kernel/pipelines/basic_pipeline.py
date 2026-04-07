@@ -85,8 +85,10 @@ def _augment_contrastive_view(self, data: Batch, edge_drop_rate: float, feature_
         out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
         out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)
         raw_pred = (out1, out2)
-        loss = self.ood_algorithm.loss_calculate(raw_pred, None, None, None, self.config)
-        return self.ood_algorithm.loss_postprocess(loss, data, None, self.config)
+        # 传入标签：有标签时走监督对比学习，无标签时走自监督
+        targets = getattr(data, 'y', None)
+        # 只返回 loss_calculate 的结果，loss_postprocess 由 train_batch 公共路径统一调用
+        return self.ood_algorithm.loss_calculate(raw_pred, targets, None, None, self.config)
 
     def _train_pretrain_microbatches(self, data: Batch, pretrain_bs: int) -> dict:
         graph_list = data.to_data_list()

@@ -1,3 +1,4 @@
+import argparse
 import os, re, glob
 import numpy as np
 import scipy.io
@@ -6,6 +7,19 @@ import dgl
 import networkx as nx
 from tqdm import tqdm
 from dgl.data.utils import save_graphs
+
+try:
+    from GOOD.data.good_datasets.metadata_v5_utils import encode_binary_label, get_subject_row
+except ModuleNotFoundError:
+    import importlib.util
+    from pathlib import Path
+
+    _module_path = Path(__file__).resolve().parent / 'good_datasets' / 'metadata_v5_utils.py'
+    _spec = importlib.util.spec_from_file_location('metadata_v5_utils', _module_path)
+    _module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_module)
+    encode_binary_label = _module.encode_binary_label
+    get_subject_row = _module.get_subject_row
 
 BASEDIR = 'GOOD/data'
 EPS = 1e-8
@@ -168,13 +182,17 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries', to
         g.ndata['FC_features'] = torch.from_numpy(fc_matrix.astype(np.float32))
         g.edata['E_features'] = g.edata.pop('weight').float()
 
-        # 简单 label：按文件名里 'sub-XXXX' 提取站点/分组（按你原来的逻辑）
-        name = os.path.basename(ts_path)
-        m = re.findall(r'sub-([A-Za-z]+)', name)
-        group = m[0] if m else 'default'
-        if group not in group2idx.keys():
-            group2idx[group] = len(group2idx.keys())
-        Labels.append(group2idx[group])
+        subject_name = os.path.basename(ts_path).replace('_schaefer100_features_timeseries.mat', '')
+        metadata_row = get_subject_row(data_name, subject_name)
+        if metadata_row is not None:
+            Labels.append(encode_binary_label(metadata_row['Group']))
+        else:
+            # Fallback for datasets without Metadata-V5 support.
+            m = re.findall(r'sub-([A-Za-z]+)', os.path.basename(ts_path))
+            group = m[0] if m else 'default'
+            if group not in group2idx:
+                group2idx[group] = len(group2idx)
+            Labels.append(group2idx[group])
 
         G_dataset.append(g)
 
@@ -237,13 +255,18 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries', to
 
 
 if __name__ == '__main__':
-    error_name = []
-    file_name_list = ['abide']
+    parser = argparse.ArgumentParser(description='Construct brain graph bins from schaefer100 files.')
+    parser.add_argument('--datasets', nargs='+', default=['abide'], help='Dataset names under GOOD/data/dataset.')
+    parser.add_argument('--edge-ratio', type=float, default=0.2)
+    parser.add_argument('--node-feat-transform', default='timeseries')
+    parser.add_argument('--topk-per-node', type=int, default=4)
+    args = parser.parse_args()
 
-    for data_name in file_name_list:
-        construct_dataset(data_name, 0.2, node_feat_transform='timeseries', topk_per_node=4)
-        # except:
-        #     print('[ERROR]: ' + data_name)
-        #     error_name.append(data_name)
-    if not len(error_name):
-        print('Done!')
+    for data_name in args.datasets:
+        construct_dataset(
+            data_name,
+            args.edge_ratio,
+            node_feat_transform=args.node_feat_transform,
+            topk_per_node=args.topk_per_node,
+        )
+    print('Done!')

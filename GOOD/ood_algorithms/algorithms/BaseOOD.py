@@ -250,6 +250,32 @@ class BaseOODAlg(ABC):
         
         return loss
         
+
+def calculate_embedding_regularizer(self, features, variance_weight: float = 0.5, covariance_weight: float = 0.05):
+    z1, z2 = features
+    if isinstance(z1, (tuple, list)):
+        z1 = z1[0]
+    if isinstance(z2, (tuple, list)):
+        z2 = z2[0]
+
+    def _variance_term(z):
+        if z.size(0) < 2:
+            return torch.zeros((), device=z.device)
+        std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
+        return torch.relu(1.0 - std).mean()
+
+    def _covariance_term(z):
+        if z.size(0) < 2:
+            return torch.zeros((), device=z.device)
+        z = z - z.mean(dim=0, keepdim=True)
+        cov = (z.T @ z) / max(z.size(0) - 1, 1)
+        off_diag = cov - torch.diag(torch.diag(cov))
+        return off_diag.pow(2).sum() / z.size(1)
+
+    var_loss = _variance_term(z1) + _variance_term(z2)
+    cov_loss = _covariance_term(z1) + _covariance_term(z2)
+    return variance_weight * var_loss + covariance_weight * cov_loss
+
     def loss_postprocess(self, loss: Tensor, data: Batch, mask: Tensor, config: Union[CommonArgs, Munch], **kwargs) -> Tensor:
         r"""
         Process loss

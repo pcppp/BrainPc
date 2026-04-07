@@ -44,6 +44,29 @@ class Pipeline:
         self.loader: Union[DataLoader, Dict[str, DataLoader]] = loader
         self.ood_algorithm: BaseOODAlg = ood_algorithm
         self.config: Union[CommonArgs, Munch] = config
+
+def _augment_contrastive_view(self, data: Batch, edge_drop_rate: float, feature_mask_rate: float, noise_std: float) -> Batch:
+    graph_list = []
+    for graph in data.to_data_list():
+        aug = graph.clone()
+        num_edges = aug.edge_index.size(1)
+        if num_edges > 0 and edge_drop_rate > 0:
+            keep_mask = torch.rand(num_edges, device=aug.edge_index.device) > edge_drop_rate
+            if keep_mask.sum() == 0:
+                keep_mask[torch.randint(0, num_edges, (1,), device=aug.edge_index.device)] = True
+            aug.edge_index = aug.edge_index[:, keep_mask]
+            if getattr(aug, 'edge_weight', None) is not None:
+                aug.edge_weight = aug.edge_weight[keep_mask]
+            if getattr(aug, 'edge_attr', None) is not None:
+                aug.edge_attr = aug.edge_attr[keep_mask]
+        if aug.x is not None and feature_mask_rate > 0:
+            feat_mask = torch.rand_like(aug.x) < feature_mask_rate
+            aug.x = aug.x.masked_fill(feat_mask, 0.0)
+        if aug.x is not None and noise_std > 0:
+            aug.x = aug.x + torch.randn_like(aug.x) * noise_std
+        graph_list.append(aug)
+    return Batch.from_data_list(graph_list).to(self.config.device)
+
     def build_contrastive_views(self, data: Batch):
         from GOOD.data.gb import build_granular_ball_view
 

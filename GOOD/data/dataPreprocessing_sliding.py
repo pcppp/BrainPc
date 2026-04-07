@@ -1,3 +1,4 @@
+import argparse
 import os, re, glob
 import numpy as np
 import scipy.io
@@ -7,6 +8,19 @@ import networkx as nx
 from tqdm import tqdm
 from dgl.data.utils import save_graphs
 import pywt
+
+try:
+    from GOOD.data.good_datasets.metadata_v5_utils import encode_binary_label, get_subject_row
+except ModuleNotFoundError:
+    import importlib.util
+    from pathlib import Path
+
+    _module_path = Path(__file__).resolve().parent / 'good_datasets' / 'metadata_v5_utils.py'
+    _spec = importlib.util.spec_from_file_location('metadata_v5_utils', _module_path)
+    _module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_module)
+    encode_binary_label = _module.encode_binary_label
+    get_subject_row = _module.get_subject_row
 
 BASEDIR = 'GOOD/data'
 EPS = 1e-8
@@ -182,13 +196,16 @@ def construct_dataset(dataName,
         g.ndata['FC_features'] = torch.from_numpy(fc_matrix.astype(np.float32))
         g.edata['E_features'] = g.edata.pop('weight').float()
 
-        # 提取标签（站点/分组）
-        name = os.path.basename(ts_path)
-        m = re.findall(r'sub-([A-Za-z]+)', name)
-        group = m[0] if m else 'default'
-        if group not in group2idx.keys():
-            group2idx[group] = len(group2idx.keys())
-        Labels.append(group2idx[group])
+        subject_name = os.path.basename(ts_path).replace('_schaefer100_features_timeseries.mat', '')
+        metadata_row = get_subject_row(data_name, subject_name)
+        if metadata_row is not None:
+            Labels.append(encode_binary_label(metadata_row['Group']))
+        else:
+            m = re.findall(r'sub-([A-Za-z]+)', os.path.basename(ts_path))
+            group = m[0] if m else 'default'
+            if group not in group2idx:
+                group2idx[group] = len(group2idx)
+            Labels.append(group2idx[group])
 
         G_dataset.append(g)
 
@@ -258,15 +275,20 @@ def construct_dataset(dataName,
     print(f'数据已保存到: {os.path.join(BASEDIR, "bin_time_dataset", f"{data_name}.bin")}')
 
 if __name__ == '__main__':
-    file_name_list = ['abide']
-    for data_name in file_name_list:
-        # 对齐旧的 sliding 预处理路径：
-        # 使用 z-score 标准化后的时间序列作为节点特征，并按 edge_ratio 做边稀疏化。
+    parser = argparse.ArgumentParser(description='Construct sliding brain graph bins from schaefer100 files.')
+    parser.add_argument('--datasets', nargs='+', default=['abide'], help='Dataset names under GOOD/data/dataset.')
+    parser.add_argument('--edge-ratio', type=float, default=0.2)
+    parser.add_argument('--node-feat-transform', default='timeseries')
+    parser.add_argument('--use-wavelet', action='store_true')
+    parser.add_argument('--topk-per-node', type=int, default=None)
+    args = parser.parse_args()
+
+    for data_name in args.datasets:
         construct_dataset(
             data_name,
-            edge_ratio=0.2,
-            node_feat_transform='timeseries',
-            use_wavelet=False,
-            topk_per_node=None,
+            edge_ratio=args.edge_ratio,
+            node_feat_transform=args.node_feat_transform,
+            use_wavelet=args.use_wavelet,
+            topk_per_node=args.topk_per_node,
         )
     print('Done!')

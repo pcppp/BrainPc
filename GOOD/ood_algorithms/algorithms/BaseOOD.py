@@ -132,39 +132,37 @@ class BaseOODAlg(ABC):
 
     def loss_calculate(self, raw_pred: Tensor, targets: Tensor, mask: Tensor, node_norm: Tensor, config: Union[CommonArgs, Munch]) -> Tensor:
         r"""
-        Calculate prediction loss without any special OOD constrains
-
-        Args:
-            raw_pred (Tensor): model predictions (for pretrain: (z1, z2) tuple; for finetune: logits)
-            targets (Tensor): input labels
-            mask (Tensor): NAN masks for data formats
-            node_norm (Tensor): node weights for normalization (for node prediction only)
-            config (Union[CommonArgs, Munch]): munchified dictionary of args (:obj:`config.metric.loss_func()`, :obj:`config.model.model_level`)
-
-        .. code-block:: python
-
-            config = munchify({model: {model_level: str('graph')},
-                                   metric: {loss_func: Accuracy}
-                                   })
-
-
-        Returns (Tensor):
-            loss tensor (same format for both pretrain and finetune modes)
-
+        Calculate loss: pretrain uses SupCon + VICReg anti-collapse; finetune uses CE.
         """
         if self.current_mode == 'pretrain':
-            # 有标签时用监督对比学习 (SupCon, temp=0.07)，否则用自监督 (SimCLR, temp=0.1)
-            # 脑网络任务标签可靠，优先走监督路径以获得更强的类别区分信号
             if targets is not None:
-                temperature = getattr(config.ood, 'temperature', 0.07)
+                temperature = getattr(config.ood, 'temperature', 0.05)
             else:
-                temperature = getattr(config.ood, 'temperature', 0.10)
+                temperature = getattr(config.ood, 'temperature', 0.07)
             contrastive_loss = self.calculate_contrastive_loss(raw_pred, temperature, labels=targets)
-            return contrastive_loss
 
-        # === 模式 B: 微调 / 正常训练 (分类) ===
+            # VICReg regularizer: actively prevent dimensional collapse
+            vicreg_loss = self.calculate_embedding_regularizer(
+                raw_pred, variance_weight=1.0, covariance_weight=0.04
+            )
+
+            # Diagnostics (printed by train loop, stored as attribute)
+            z1, z2 = raw_pred
+            if isinstance(z1, (tuple, list)): z1 = z1[0]
+            if isinstance(z2, (tuple, list)): z2 = z2[0]
+            with torch.no_grad():
+                z1n = torch.nn.functional.normalize(z1, dim=1)
+                z2n = torch.nn.functional.normalize(z2, dim=1)
+                self._diag_emb_std = z1.std(dim=0).mean().item()
+                self._diag_pair_sim = (z1n * z2n).sum(dim=1).mean().item()
+                all_sim = z1n @ z2n.T
+                off_mask = ~torch.eye(z1n.size(0), dtype=torch.bool, device=z1n.device)
+                self._diag_neg_sim = all_sim[off_mask].mean().item()
+
+            total = contrastive_loss + vicreg_loss
+            return total
+
         else:
-            # 原有的逻辑保持不变
             loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
             loss = loss * node_norm * mask.sum() if config.model.model_level == 'node' else loss
             return loss

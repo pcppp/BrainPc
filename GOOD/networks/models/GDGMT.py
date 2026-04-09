@@ -84,8 +84,10 @@ class GBGMT(GNNBasic):
         self.entropy_loss = 0.0
         self.proj_head = nn.Sequential(
             nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
+            nn.BatchNorm1d(config.model.dim_hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
+            nn.BatchNorm1d(config.model.dim_hidden, affine=False)
         )
         self.mode = 'finetune'
         # === 【新增 1】 定义 Projection Head (用于预训练) ===
@@ -185,7 +187,7 @@ class GDGMT(GNNBasic):
             self.cnn = nn.Conv1d(1, cnn_out_channels, kernel_size=5, padding=2)
             self.pool = nn.MaxPool1d(kernel_size=2)
             self.lstm = nn.LSTM(cnn_out_channels, lstm_hidden_size, batch_first=True)
-            self.dropout = nn.Dropout(p=0.7)
+            self.dropout = nn.Dropout(p=0.3)
             # 修改 config 中的 dim_node 为 CNN 输出维度
             config.dataset.dim_node = cnn_out_channels
         # ----------------origin---------------使用GIN
@@ -202,10 +204,14 @@ class GDGMT(GNNBasic):
         self.causal_adj = None
         self.diffusion_loss = 0.0
         self.entropy_loss = 0.0
+        # Projection head: 扩展到 2x hidden dim，BN 防塌缩
+        proj_dim = config.model.dim_hidden * 2
         self.proj_head = nn.Sequential(
-            nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
+            nn.Linear(config.model.dim_hidden, proj_dim),
+            nn.BatchNorm1d(proj_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
+            nn.Linear(proj_dim, config.model.dim_hidden),
+            nn.BatchNorm1d(config.model.dim_hidden, affine=False)
         )
         self.mode = 'finetune'
 

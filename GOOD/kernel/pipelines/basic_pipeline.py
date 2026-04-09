@@ -179,7 +179,10 @@ class Pipeline:
         # 处理 loss 格式 (如果是 dict 或其他格式)
         loss = self.ood_algorithm.loss_postprocess(loss, data, None, self.config)
         
-        self.ood_algorithm.backward(loss)
+        # Gradient clipping to stabilize pretrain
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.ood_algorithm.optimizer.step()
 
         return {'loss': loss.detach()}
 
@@ -201,11 +204,18 @@ class Pipeline:
         pretrain_bs = getattr(self.config.train, 'pretrain_bs', self.config.train.train_bs)
         print(f'#IN# Pre-train effective batch size: {pretrain_bs}')
 
+        warmup_epochs = min(5, pretrain_epochs // 2)
+        base_lr = self.config.train.pre_lr if hasattr(self.config.train, 'pre_lr') else 5e-4
         for epoch in range(pretrain_epochs):
-            self.config.train.epoch = epoch # 记录当前 epoch
+            self.config.train.epoch = epoch
+            # Linear warmup
+            if epoch < warmup_epochs:
+                warmup_lr = 1e-5 + (base_lr - 1e-5) * epoch / max(warmup_epochs, 1)
+                for pg in self.ood_algorithm.optimizer.param_groups:
+                    pg['lr'] = warmup_lr
             mean_loss = 0
             processed_steps = 0
-            self.ood_algorithm.stage_control(self.config) # 某些动态调整
+            self.ood_algorithm.stage_control(self.config)
 
             pbar = tqdm(
                 enumerate(self.loader['train']),
@@ -225,7 +235,13 @@ class Pipeline:
                 except Exception:
                     pass
 
-            print(f'#IN# Pre-train Epoch {epoch}: Contrastive Loss {mean_loss:.4f}')
+            # Print diagnostics if available
+            diag_str = ""
+            if hasattr(self.ood_algorithm, '_diag_emb_std'):
+                diag_str = (f" | emb_std={self.ood_algorithm._diag_emb_std:.4f}"
+                            f" pair_sim={self.ood_algorithm._diag_pair_sim:.4f}"
+                            f" neg_sim={self.ood_algorithm._diag_neg_sim:.4f}")
+            print(f'#IN# Pre-train Epoch {epoch}: Loss {mean_loss:.4f}{diag_str}')
             
             # 预训练阶段通常不需要频繁做完整的 val/test 评估，或者只看 loss 即可
             # 如果想看 embedding 质量，可以加简单的评估

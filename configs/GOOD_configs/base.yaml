@@ -11,7 +11,7 @@ pytest: False
 pipeline: Pipeline
 num_workers: 0
 train:
-  weight_decay: 0.
+  weight_decay: 5e-4
   save_gap: 10
   tr_ctn: False
   ctn_epoch: 0

@@ -9,7 +9,7 @@ ood:
   diffusion_trade_off: 0.5
   entropy_trade_off: 0.01
   feature_dropout: 0.5
-  temperature: 0.08
+  temperature: 0.05
   variance_weight: 0.5
   covariance_weight: 0.02
   extra_param:
@@ -19,11 +19,11 @@ ood:
     - 5    # sample_rounds
 train:
   max_epoch: 20
-  pre_epoch: 50
+  pre_epoch: 20
   pretrain_bs: 32
   lr: 2e-3
   pre_lr: 5e-4
-  ball_r: 0.25
+  ball_r: 0.5
   orig_edge_drop: 0.05
   coarse_edge_drop: 0.20
   orig_feature_mask: 0.05

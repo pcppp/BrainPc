@@ -41,6 +41,9 @@ class BrainOOD(BaseOODAlg):
             config: munchified dictionary of args.
 
         """
+        # Single-stage training: skip stage transition when stage_stones is empty
+        if not config.train.stage_stones:
+            return
         if self.stage == 0 and at_stage(1, config):
             reset_random_seed(config)
             self.stage = 1
@@ -89,12 +92,17 @@ class BrainOOD(BaseOODAlg):
         #              (1 - att) * torch.log((1 - att) / (1 - r + eps) + eps)).mean()
 
         self.mean_loss = loss.mean()
-        # self.spec_loss = config.ood.ood_param * info_loss + config.ood.trade_off * similarity_loss(self.model.causal_adj) + \
-        #                  config.ood.diffusion_trade_off * self.model.diffusion_loss + config.ood.entropy_trade_off * self.model.entropy_loss
 
-        # loss = self.mean_loss + self.spec_loss
-        loss = self.mean_loss  # 消融损失
-        return loss
+        # Gate sparsity regularization from SiteCalibration
+        gate_lambda = getattr(config.ood, 'gate_sparsity_weight', 0.01)
+        if gate_lambda > 0 and hasattr(self.model, 'calib_gate_reg'):
+            import torch as _torch
+            gate_reg = self.model.calib_gate_reg
+            if isinstance(gate_reg, (int, float)):
+                gate_reg = _torch.tensor(gate_reg, device=self.mean_loss.device)
+            self.mean_loss = self.mean_loss + gate_lambda * gate_reg
+
+        return self.mean_loss
 
     def get_r(self, decay_interval, decay_r, current_epoch, init_r=0.9, final_r=0.5):
         r = init_r - current_epoch // decay_interval * decay_r

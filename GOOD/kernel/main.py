@@ -184,37 +184,23 @@ def run_10fold_once(config):
         # 训练
         pipeline.load_task(fold=i)
 
-        # ================= [可视化核心代码 Start] =================
+        # ================= [可视化: 训练前后对比] =================
         if i == 0 and emb_before is not None:
             print(">>> [t-SNE] Extracting embeddings AFTER training...")
             try:
-               
-                # 生成对比图
-                plot_name = f"tsne_fold{i}_L1_{config.ood.entropy_trade_off}_L2_{config.ood.trade_off}.png"
-                save_path = log_dir / plot_name
-                
-                # strict=False 很重要：因为微调阶段可能加了分类头，预训练权重里没有，不加这个会报错
-                model.load_state_dict(torch.load('temp_pretrain_snapshot.pt'), strict=False)
-                print(">>> [Snapshot] 快照加载成功！现在的模型回到了纯对比学习状态。")
-                
-                # 提取【预训练状态】 (After Pretrain)
-                emb_pretrain, y_pretrain = extract_embeddings(model, vis_loader, config.device, max_samples=500)
-                
-                # 5. 画图：重点对比 [初始 vs 预训练]
-                if emb_before is not None and emb_pretrain is not None:
-                    plot_name = f"Effect_of_CL_fold{i}_L1_{config.ood.entropy_trade_off}.png"
-                    
-                    # 这里的 labels 用 y_before (真值标签) 来上色，
-                    # 看看无监督的对比学习是否把同类聚在一起了
+                emb_after, y_after = extract_embeddings(model, vis_loader, config.device, max_samples=500)
+                if emb_after is not None:
+                    plot_name = f"tsne_fold{i}_before_vs_after.png"
+                    save_path = log_dir / plot_name
                     plot_tsne_comparison(
-                        emb_before, y_before, 
-                        emb_pretrain, y_pretrain, 
+                        emb_before, y_before,
+                        emb_after, y_after,
                         save_path=save_path
                     )
-                    print(f">>> [Success] 对比学习效果图已保存: {plot_name}")
+                    print(f">>> [Success] t-SNE对比图已保存: {plot_name}")
             except Exception as e:
-                print(f"#WARNING# t-SNE extraction/plotting failed after training: {e}")
-        # ================= [可视化核心代码 End] =================
+                print(f"#WARNING# t-SNE failed after training: {e}")
+        # ================= [可视化 End] =================
         # 测试（按你原逻辑）
         if config.task == 'train':
             pipeline.task = 'test'

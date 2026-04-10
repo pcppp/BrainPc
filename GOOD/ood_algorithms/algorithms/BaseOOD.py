@@ -270,12 +270,17 @@ class BaseOODAlg(ABC):
         return variance_weight * var_loss + covariance_weight * cov_loss
 
     def loss_postprocess(self, loss: Tensor, data: Batch, mask: Tensor, config: Union[CommonArgs, Munch], **kwargs) -> Tensor:
-        if self.current_mode == 'pretrain':
-            self.mean_loss = loss
-            return self.mean_loss
-        else:
-            self.mean_loss = loss.sum() / mask.sum()
-            return self.mean_loss
+        self.mean_loss = loss.sum() / mask.sum()
+
+        # Gate sparsity regularization from SiteCalibration
+        gate_lambda = getattr(config.ood, 'gate_sparsity_weight', 0.01)
+        if gate_lambda > 0 and hasattr(self.model, 'calib_gate_reg'):
+            gate_reg = self.model.calib_gate_reg
+            if isinstance(gate_reg, (int, float)):
+                gate_reg = torch.tensor(gate_reg, device=self.mean_loss.device)
+            self.mean_loss = self.mean_loss + gate_lambda * gate_reg
+
+        return self.mean_loss
 
     def set_up(self, model: torch.nn.Module, config: Union[CommonArgs, Munch]):
         self.model: torch.nn.Module = model

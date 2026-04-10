@@ -144,10 +144,10 @@ def _aggregate_coarse_graph(data: Data, cluster_assign: torch.Tensor, target_bal
         coarse_src = unique_keys // num_balls
         coarse_dst = unique_keys % num_balls
         coarse_edge_index = torch.stack([coarse_src, coarse_dst], dim=0)
-        coarse_edge_weight = avg_weight.unsqueeze(-1)
+        coarse_edge_weight = avg_weight  # keep 1D like original graphs
     else:
         coarse_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-        coarse_edge_weight = torch.empty((0, 1), dtype=torch.float32, device=device)
+        coarse_edge_weight = torch.empty((0,), dtype=torch.float32, device=device)
 
     coarse = Data(
         x=coarse_x,
@@ -155,7 +155,7 @@ def _aggregate_coarse_graph(data: Data, cluster_assign: torch.Tensor, target_bal
         edge_weight=coarse_edge_weight,
         y=data.y.clone() if getattr(data, 'y', None) is not None else None,
     )
-    coarse.edge_attr = coarse_edge_weight
+    coarse.edge_attr = coarse_edge_weight.unsqueeze(-1) if coarse_edge_weight.dim() == 1 and coarse_edge_weight.numel() > 0 else coarse_edge_weight
     coarse.num_nodes = num_balls
     if hasattr(data, 'domain'):
         coarse.domain = data.domain

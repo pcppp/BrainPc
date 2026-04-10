@@ -33,6 +33,20 @@ For this feature branch on the shared server, prefer running from the repo root 
 PYTHONPATH=$PWD python -m GOOD.kernel.main --config_path GOOD_configs/GOODABIDE/site/concept/BrainOOD.yaml
 ```
 
+The default startup path now also auto-selects an almost-idle physical GPU when `CUDA_VISIBLE_DEVICES` is not already set. It maps the chosen physical card into the process and then runs on logical `cuda:0`, so even the original `goodtg` or `python -m GOOD.kernel.main ...` command follows the same GPU-selection rule.
+
+To avoid GPU OOM on a shared server, use the auto-GPU launcher instead of hard-coding `gpu_idx`. It picks an almost-idle physical GPU, exports `CUDA_VISIBLE_DEVICES` to that card, and forces the framework-side `gpu_idx` to `0` so device numbering stays consistent inside the process:
+
+```bash
+./scripts/run_brainood_auto_gpu.sh
+```
+
+You can override the selection threshold when the server is busier than usual:
+
+```bash
+MIN_FREE_MB=16000 MAX_USED_MB=2000 MAX_UTIL=20 ./scripts/run_brainood_auto_gpu.sh
+```
+
 ## Contact
 
 If you have any questions, please feel free to reach out at `jiaxing003@e.ntu.edu.sg`.

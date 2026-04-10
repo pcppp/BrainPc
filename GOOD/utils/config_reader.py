@@ -3,6 +3,8 @@ overwrite configuration arguments by command arguments.
 """
 
 import copy
+import os
+import subprocess
 import warnings
 from os.path import join as opj
 from pathlib import Path
@@ -141,6 +143,51 @@ def search_tap_args(args: CommonArgs, query: str):
     return found, value
 
 
+
+
+def _auto_select_visible_gpu(requested_gpu_idx: int):
+    if not torch.cuda.is_available():
+        return requested_gpu_idx, None
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        return requested_gpu_idx, None
+
+    min_free = int(os.environ.get("MIN_FREE_MB", "20000"))
+    max_used = int(os.environ.get("MAX_USED_MB", "500"))
+    max_util = int(os.environ.get("MAX_UTIL", "10"))
+
+    try:
+        query = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except Exception:
+        return requested_gpu_idx, None
+
+    rows = []
+    for line in query.strip().splitlines():
+        parts = [part.strip() for part in line.split(',')]
+        if len(parts) != 4:
+            continue
+        try:
+            idx, used, free, util = map(int, parts)
+        except ValueError:
+            continue
+        rows.append({"idx": idx, "used": used, "free": free, "util": util})
+
+    if not rows:
+        return requested_gpu_idx, None
+
+    qualified = [r for r in rows if r["free"] >= min_free and r["used"] <= max_used and r["util"] <= max_util]
+    best = max(qualified or rows, key=lambda r: r["free"])
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(best["idx"])
+    return 0, best
+
 def args2config(config: Union[CommonArgs, Munch], args: CommonArgs):
     r"""
     Overwrite config by assigned arguments.
@@ -232,7 +279,15 @@ def process_configs(config: Union[CommonArgs, Munch], fold: int):
     # --- Other settings ---
     if config.train.max_epoch > 100:
         config.train.save_gap = config.train.max_epoch // 10
+
+    selected_gpu_idx, selected_gpu_meta = _auto_select_visible_gpu(config.gpu_idx)
+    config.gpu_idx = selected_gpu_idx
+    config.auto_selected_gpu = selected_gpu_meta
     config.device = torch.device(f'cuda:{config.gpu_idx}' if torch.cuda.is_available() else 'cpu')
+    if selected_gpu_meta is not None:
+        print(f"#IN# Auto-selected physical GPU {selected_gpu_meta['idx']} (used={selected_gpu_meta['used']}MB free={selected_gpu_meta['free']}MB util={selected_gpu_meta['util']}%).")
+        print("#IN# CUDA_VISIBLE_DEVICES is set automatically, so the process runs on logical cuda:0.")
+
     config.train.stage_stones.append(100000)
 
     # --- Attach train_helper and metric modules ---

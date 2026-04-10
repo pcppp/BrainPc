@@ -2,6 +2,7 @@ includes:
   - base.yaml
 model:
   model_name: GDGMTvGIN #
+  calib_gate_init: -3.0
 ood:
   # ood_alg: BrainOOD
   ood_param: 0.0    # info loss coefficient
@@ -12,6 +13,7 @@ ood:
   temperature: 0.10
   variance_weight: 0.5
   covariance_weight: 0.02
+  gate_sparsity_weight: 0.01
   extra_param:
     - "bern"    # sampling method
     - 20      # decay_interval
@@ -31,4 +33,3 @@ train:
   coarse_feature_mask: 0.20
   orig_noise_std: 0.01
   coarse_noise_std: 0.03
-

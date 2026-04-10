@@ -18,6 +18,7 @@ from .GINs import GINFeatExtractor, DGINFeatExtractor
 from .GAT import GATFeatExtractor
 from .GINvirtualnode import vGINFeatExtractor, DvGINFeatExtractor
 from .GCNs import DGCNFeatExtractor
+from .SiteCalibration import SiteCalibration
 
 class SimpleCNN(nn.Module):
     """Simple 1D CNN encoder for temporal window features."""
@@ -214,6 +215,14 @@ class GDGMT(GNNBasic):
         )
         self.mode = 'finetune'
 
+        # Sample-level site calibration (placed before GNN)
+        calib_dim = lstm_hidden_size if self.use_cnn else config.dataset.dim_node
+        self.site_calibration = SiteCalibration(
+            feat_dim=calib_dim,
+            gate_init_bias=getattr(config.model, 'calib_gate_init', -3.0),
+        )
+        self.calib_gate_reg = 0.0  # updated each forward, used for loss
+
     def forward(self, *args, **kwargs):
         r"""
         The GSAT model implementation.
@@ -228,35 +237,38 @@ class GDGMT(GNNBasic):
         """
         data = kwargs.get('data')
 
-        node_features = None
+        # --- Extract node features ---
         if self.use_cnn:
-            x = data.x
-            x = x.unsqueeze(1)
+            x = data.x.unsqueeze(1)
             x = self.cnn(x)
             x = self.pool(x)
             x = x.transpose(1, 2)
-            lstm_out, (h_n, c_n) = self.lstm(x)
-            node_features = self.dropout(lstm_out[:, -1, :])
+            lstm_out, _ = self.lstm(x)
+            node_features = lstm_out[:, -1, :]
+            if self.mode != 'pretrain':
+                node_features = self.dropout(node_features)
+        else:
+            node_features = data.x  # GNN directly uses node features
 
+        # --- Site calibration (always applied, before GNN) ---
+        batch_idx = data.batch if data.batch is not None else torch.zeros(
+            node_features.size(0), dtype=torch.long, device=node_features.device)
+        node_features, gate_reg = self.site_calibration(node_features, batch_idx)
+        self.calib_gate_reg = gate_reg
+
+        # --- Pretrain mode: projection head for contrastive learning ---
         if self.mode == 'pretrain':
-            if self.use_cnn:
-                # In pretrain: re-run CNN WITHOUT dropout for cleaner features
-                # The GNN's own dropout provides sufficient stochasticity for SimCSE
-                x_clean = data.x.unsqueeze(1)
-                x_clean = self.cnn(x_clean)
-                x_clean = self.pool(x_clean)
-                x_clean = x_clean.transpose(1, 2)
-                lstm_out_clean, _ = self.lstm(x_clean)
-                clean_features = lstm_out_clean[:, -1, :]
-                graph_emb, _ = self.gnn(clean_features, *args, **kwargs)
+            if node_features is not None:
+                graph_emb, _ = self.gnn(node_features, *args, **kwargs)
             else:
                 graph_emb, _ = self.gnn(*args, **kwargs)
             return self.proj_head(graph_emb)
 
+        # --- Finetune mode: classification with sampling ---
         sampling_logits = []
         sampling_trials = self.sampling_rounds
         while len(sampling_logits) < sampling_trials:
-            if self.use_cnn:
+            if node_features is not None:
                 x_out, diff_loss = self.gnn(node_features, *args, **kwargs)
             else:
                 x_out, diff_loss = self.gnn(*args, **kwargs)
@@ -322,21 +334,14 @@ class GDGMT(GNNBasic):
     def set_mode(self, mode):
         self.mode = mode
 
+        # All components trainable in single-stage training
         for param in self.gnn.parameters():
             param.requires_grad = True
-
-        if mode == 'pretrain':
-            for param in self.proj_head.parameters():
-                param.requires_grad = True
-            for param in self.classifier.parameters():
-                param.requires_grad = False
-        elif mode == 'finetune':
-            for param in self.classifier.parameters():
-                param.requires_grad = True
-            for param in self.proj_head.parameters():
-                param.requires_grad = False
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        for param in self.classifier.parameters():
+            param.requires_grad = True
+        # proj_head always trainable (used by cross-scale contrastive reg)
+        for param in self.proj_head.parameters():
+            param.requires_grad = True
 
 
 @register.model_register

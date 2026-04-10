@@ -136,15 +136,10 @@ class BaseOODAlg(ABC):
         """
         if self.current_mode == 'pretrain':
             if targets is not None:
-                temperature = getattr(config.ood, 'temperature', 0.05)
-            else:
                 temperature = getattr(config.ood, 'temperature', 0.07)
+            else:
+                temperature = getattr(config.ood, 'temperature', 0.10)
             contrastive_loss = self.calculate_contrastive_loss(raw_pred, temperature, labels=targets)
-
-            # VICReg regularizer: actively prevent dimensional collapse
-            vicreg_loss = self.calculate_embedding_regularizer(
-                raw_pred, variance_weight=1.0, covariance_weight=0.04
-            )
 
             # Diagnostics (printed by train loop, stored as attribute)
             z1, z2 = raw_pred
@@ -153,17 +148,26 @@ class BaseOODAlg(ABC):
             with torch.no_grad():
                 z1n = torch.nn.functional.normalize(z1, dim=1)
                 z2n = torch.nn.functional.normalize(z2, dim=1)
+                # Measure std BEFORE BN (on raw embedding) to detect real collapse
                 self._diag_emb_std = z1.std(dim=0).mean().item()
                 self._diag_pair_sim = (z1n * z2n).sum(dim=1).mean().item()
                 all_sim = z1n @ z2n.T
                 off_mask = ~torch.eye(z1n.size(0), dtype=torch.bool, device=z1n.device)
                 self._diag_neg_sim = all_sim[off_mask].mean().item()
 
-            total = contrastive_loss + vicreg_loss
-            return total
+            return contrastive_loss
 
         else:
-            loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
+            # Manual label smoothing (0.1) for overfitting prevention
+            import torch.nn.functional as F
+            if raw_pred.dim() == 2 and raw_pred.size(1) > 1:
+                num_classes = raw_pred.size(1)
+                log_probs = F.log_softmax(raw_pred, dim=1)
+                nll = F.nll_loss(log_probs, targets.long(), reduction='none')
+                smooth = -log_probs.mean(dim=1)
+                loss = (0.9 * nll + 0.1 * smooth) * mask
+            else:
+                loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
             loss = loss * node_norm * mask.sum() if config.model.model_level == 'node' else loss
             return loss
    

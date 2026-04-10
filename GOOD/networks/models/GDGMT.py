@@ -204,14 +204,13 @@ class GDGMT(GNNBasic):
         self.causal_adj = None
         self.diffusion_loss = 0.0
         self.entropy_loss = 0.0
-        # Projection head: 扩展到 2x hidden dim，BN 防塌缩
+        # Projection head: wider hidden, BN only in middle (not output)
         proj_dim = config.model.dim_hidden * 2
         self.proj_head = nn.Sequential(
             nn.Linear(config.model.dim_hidden, proj_dim),
             nn.BatchNorm1d(proj_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, config.model.dim_hidden),
-            nn.BatchNorm1d(config.model.dim_hidden, affine=False)
+            nn.Linear(proj_dim, config.model.dim_hidden)
         )
         self.mode = 'finetune'
 
@@ -241,7 +240,15 @@ class GDGMT(GNNBasic):
 
         if self.mode == 'pretrain':
             if self.use_cnn:
-                graph_emb, _ = self.gnn(node_features, *args, **kwargs)
+                # In pretrain: re-run CNN WITHOUT dropout for cleaner features
+                # The GNN's own dropout provides sufficient stochasticity for SimCSE
+                x_clean = data.x.unsqueeze(1)
+                x_clean = self.cnn(x_clean)
+                x_clean = self.pool(x_clean)
+                x_clean = x_clean.transpose(1, 2)
+                lstm_out_clean, _ = self.lstm(x_clean)
+                clean_features = lstm_out_clean[:, -1, :]
+                graph_emb, _ = self.gnn(clean_features, *args, **kwargs)
             else:
                 graph_emb, _ = self.gnn(*args, **kwargs)
             return self.proj_head(graph_emb)

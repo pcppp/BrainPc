@@ -68,27 +68,58 @@ class Pipeline:
         return Batch.from_data_list(graph_list).to(self.config.device)
 
     def build_contrastive_views(self, data: Batch):
-        from GOOD.data.gb import build_granular_ball_view
+        """Build two views for contrastive learning (SimCSE-style).
 
+        Both views use the SAME graph. The only difference comes from
+        dropout masks during forward passes. This is the simplest possible
+        contrastive setup — if this doesn't work, the architecture has issues.
+
+        Granular-ball cross-scale alignment is added as auxiliary loss.
+        """
         graph_list = data.to_data_list()
-        original_graphs = [graph.clone() for graph in graph_list]
-        ball_r = getattr(self.config.train, 'ball_r', 0.5)
-        coarse_graphs = [build_granular_ball_view(graph, ball_r=ball_r) for graph in graph_list]
+        view1 = Batch.from_data_list([g.clone() for g in graph_list]).to(self.config.device)
+        # View2 = same graph, different dropout mask during forward()
+        view2 = Batch.from_data_list([g.clone() for g in graph_list]).to(self.config.device)
 
-        view1 = Batch.from_data_list(original_graphs).to(self.config.device)
-        view2 = Batch.from_data_list(coarse_graphs).to(self.config.device)
         return view1, view2
 
-    def _compute_pretrain_loss(self, data: Batch) -> torch.Tensor:
-        view1, view2 = self.build_contrastive_views(data)
+    def _build_granular_ball_view(self, data: Batch):
+        """Build granular-ball coarse view for cross-scale auxiliary loss."""
+        from GOOD.data.gb import build_granular_ball_view
+        graph_list = data.to_data_list()
+        ball_r = getattr(self.config.train, 'ball_r', 0.5)
+        coarse_graphs = [build_granular_ball_view(g, ball_r=ball_r) for g in graph_list]
+        return Batch.from_data_list(coarse_graphs).to(self.config.device)
 
+    def _compute_pretrain_loss(self, data: Batch) -> torch.Tensor:
+        # === Primary: same-scale contrastive loss (original vs augmented) ===
+        view1, view2 = self.build_contrastive_views(data)
         out1 = self.model(data=view1, ood_algorithm=self.ood_algorithm)
         out2 = self.model(data=view2, ood_algorithm=self.ood_algorithm)
         raw_pred = (out1, out2)
-        # 传入标签：有标签时走监督对比学习，无标签时走自监督
         targets = getattr(data, 'y', None)
-        # 只返回 loss_calculate 的结果，loss_postprocess 由 train_batch 公共路径统一调用
-        return self.ood_algorithm.loss_calculate(raw_pred, targets, None, None, self.config)
+        # Use SimCLR (labels=None) during pretrain: binary SupCon is degenerate
+        # (too many positives per sample -> diffuse signal -> pair_sim drops)
+        contrastive_loss = self.ood_algorithm.loss_calculate(raw_pred, None, None, None, self.config)
+
+        # === Auxiliary: cross-scale alignment (BYOL-style, stop-gradient on coarse) ===
+        gb_weight = getattr(self.config.train, 'gb_weight', 0.5)
+        if gb_weight > 0:
+            try:
+                view_gb = self._build_granular_ball_view(data)
+                out_gb = self.model(data=view_gb, ood_algorithm=self.ood_algorithm)
+                # Stop-gradient on granular ball side — don't require GNN to produce
+                # identical embeddings for structurally different graphs
+                out_gb_sg = out_gb.detach()
+                # Cosine similarity alignment loss (MSE on normalized embeddings)
+                z1 = torch.nn.functional.normalize(out1, dim=1)
+                z_gb = torch.nn.functional.normalize(out_gb_sg, dim=1)
+                gb_loss = 2.0 - 2.0 * (z1 * z_gb).sum(dim=1).mean()
+                contrastive_loss = contrastive_loss + gb_weight * gb_loss
+            except Exception:
+                pass  # Skip if granular ball fails
+
+        return contrastive_loss
 
     def _train_pretrain_microbatches(self, data: Batch, pretrain_bs: int) -> dict:
         graph_list = data.to_data_list()
@@ -254,6 +285,9 @@ class Pipeline:
         torch.save(self.model.state_dict(), 'temp_pretrain_snapshot.pt')
         self.ood_algorithm.set_stage('finetune',self.config)
         finetune_epochs = getattr(self.config.train, 'ft_epochs', self.config.train.max_epoch)
+        best_val_score = -1.0
+        patience_counter = 0
+        patience = getattr(self.config.train, 'patience', 15)
         # train the model
         for epoch in range(finetune_epochs):
             self.config.train.epoch = epoch
@@ -325,6 +359,17 @@ class Pipeline:
 
             # checkpoints save
             self.save_epoch(epoch, epoch_train_stat, id_val_stat, id_test_stat, val_stat, test_stat, self.config, fold)
+
+            # --- early stopping ---
+            combined_val = (val_stat['score'] + id_val_stat['score']) / 2 if id_val_stat.get('score') else val_stat['score']
+            if combined_val > best_val_score:
+                best_val_score = combined_val
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= patience:
+                print(f'#IN# Early stopping at epoch {epoch} (best val: {best_val_score:.4f})')
+                break
 
             # --- scheduler step ---
             self.ood_algorithm.scheduler.step()

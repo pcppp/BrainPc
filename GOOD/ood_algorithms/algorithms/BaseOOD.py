@@ -158,16 +158,7 @@ class BaseOODAlg(ABC):
             return contrastive_loss
 
         else:
-            # Manual label smoothing (0.1) for overfitting prevention
-            import torch.nn.functional as F
-            if raw_pred.dim() == 2 and raw_pred.size(1) > 1:
-                num_classes = raw_pred.size(1)
-                log_probs = F.log_softmax(raw_pred, dim=1)
-                nll = F.nll_loss(log_probs, targets.long(), reduction='none')
-                smooth = -log_probs.mean(dim=1)
-                loss = (0.9 * nll + 0.1 * smooth) * mask
-            else:
-                loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
+            loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
             loss = loss * node_norm * mask.sum() if config.model.model_level == 'node' else loss
             return loss
    

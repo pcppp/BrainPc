@@ -45,48 +45,93 @@ class Pipeline:
         self.ood_algorithm: BaseOODAlg = ood_algorithm
         self.config: Union[CommonArgs, Munch] = config
 
-    def _compute_contrastive_reg(self, data: Batch) -> torch.Tensor:
-        """Cross-scale contrastive regularization: original graph vs granular-ball coarse view.
+    @staticmethod
+    def _vicreg_loss(z1, z2, sim_weight=1.0, var_weight=1.0, cov_weight=0.02):
+        """VICReg-style loss: invariance + variance + covariance.
+        Better than InfoNCE for small sample sizes (no hard negatives).
+        """
+        # Invariance: MSE between paired embeddings
+        inv_loss = torch.nn.functional.mse_loss(z1, z2)
 
-        Extracts graph-level embeddings via the GNN encoder (shared with classification),
-        then projects through proj_head for contrastive alignment.
-        No mode switching — proj_head is always trainable, used directly.
+        # Variance: hinge loss to keep std above 1 (prevent collapse)
+        def var_term(z):
+            std = z.std(dim=0)
+            return torch.relu(1.0 - std).mean()
+        var_loss = var_term(z1) + var_term(z2)
+
+        # Covariance: off-diagonal covariance should be zero
+        def cov_term(z):
+            n = z.size(0)
+            z_centered = z - z.mean(dim=0)
+            cov = (z_centered.T @ z_centered) / max(n - 1, 1)
+            off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+            return off_diag / z.size(1)
+        cov_loss = cov_term(z1) + cov_term(z2)
+
+        return sim_weight * inv_loss + var_weight * var_loss + cov_weight * cov_loss
+
+    def _compute_contrastive_reg(self, data: Batch) -> dict:
+        """Cross-scale contrastive regularization using VICReg-style loss.
+
+        Returns dict with gb_loss, gate_cons_loss, site_adv_loss.
         """
         from GOOD.data.gb import build_granular_ball_view
+        from GOOD.networks.models.SiteCalibration import SiteCalibration as SC
 
         graph_list = data.to_data_list()
         ball_r = getattr(self.config.train, 'ball_r', 0.5)
 
-        # Build granular-ball coarse view
         coarse_graphs = [build_granular_ball_view(g, ball_r=ball_r) for g in graph_list]
         view_gb = Batch.from_data_list(coarse_graphs).to(self.config.device)
         view_orig = Batch.from_data_list([g.clone() for g in graph_list]).to(self.config.device)
 
-        # Get graph-level embeddings from encoder (reuse the finetune forward path up to GNN)
-        # We extract embeddings before the classifier, then project
-        emb_orig = self._extract_graph_embedding(view_orig)
-        emb_gb = self._extract_graph_embedding(view_gb)
+        emb_orig, calib_orig = self._extract_graph_embedding(view_orig, return_calib_info=True)
+        emb_gb, calib_gb = self._extract_graph_embedding(view_gb, return_calib_info=True)
 
-        # Project through contrastive head
         proj_orig = self.model.proj_head(emb_orig)
         proj_gb = self.model.proj_head(emb_gb)
 
-        # Symmetric InfoNCE
-        z1 = torch.nn.functional.normalize(proj_orig, dim=1)
-        z2 = torch.nn.functional.normalize(proj_gb, dim=1)
-        temperature = getattr(self.config.ood, 'temperature', 0.10)
+        # VICReg instead of InfoNCE
+        var_w = getattr(self.config.ood, 'variance_weight', 0.5)
+        cov_w = getattr(self.config.ood, 'covariance_weight', 0.02)
+        gb_loss = self._vicreg_loss(proj_orig, proj_gb,
+                                     sim_weight=1.0, var_weight=var_w, cov_weight=cov_w)
 
-        sim = torch.mm(z1, z2.T) / temperature
-        labels = torch.arange(z1.size(0), device=z1.device)
-        loss = (torch.nn.functional.cross_entropy(sim, labels)
-                + torch.nn.functional.cross_entropy(sim.T, labels)) / 2
+        gate_cons_loss = SC.gate_consistency_loss(calib_orig, calib_gb)
 
-        return loss
+        # Site adversarial loss
+        site_adv_loss = torch.tensor(0.0, device=data.x.device)
+        if (self.model.site_calibration.site_classifier is not None
+                and hasattr(view_orig, 'env_id')):
+            site_labels = view_orig.env_id
+            if site_labels is not None:
+                model = self.model
+                node_feat = view_orig.x if not model.use_cnn else None
+                if node_feat is not None:
+                    batch_idx = view_orig.batch if view_orig.batch is not None else torch.zeros(
+                        node_feat.size(0), dtype=torch.long, device=node_feat.device)
+                    h_calib, _ = model.site_calibration(node_feat, batch_idx)
+                    grl_lam = self.config.train.alpha
+                    site_adv_loss = model.site_calibration.site_adversarial_loss(
+                        h_calib, batch_idx, site_labels, grl_lambda=grl_lam)
 
-    def _extract_graph_embedding(self, data: Batch) -> torch.Tensor:
+        return {
+            'gb_loss': gb_loss,
+            'gate_cons_loss': gate_cons_loss,
+            'site_adv_loss': site_adv_loss,
+        }
+
+    def _extract_graph_embedding(self, data: Batch, return_calib_info: bool = False):
         """Extract graph-level embedding from the shared encoder (Calibration+GNN).
 
         Reuses the same feature extraction path as classification but stops before classifier.
+
+        Args:
+            data: batched graph data
+            return_calib_info: if True, also return calibration info (for gate-cons loss)
+
+        Returns:
+            graph_emb or (graph_emb, calib_info)
         """
         model = self.model
         if model.use_cnn:
@@ -102,8 +147,10 @@ class Pipeline:
         # Site calibration (always applied)
         batch_idx = data.batch if data.batch is not None else torch.zeros(
             node_features.size(0), dtype=torch.long, device=node_features.device)
-        node_features, _ = model.site_calibration(node_features, batch_idx)
+        node_features, calib_info = model.site_calibration(node_features, batch_idx)
         graph_emb, _ = model.gnn(node_features, data=data, ood_algorithm=self.ood_algorithm)
+        if return_calib_info:
+            return graph_emb, calib_info
         return graph_emb
 
     def train_batch(self, data: Batch, pbar) -> dict:
@@ -130,20 +177,53 @@ class Pipeline:
         cls_loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
         cls_loss = self.ood_algorithm.loss_postprocess(cls_loss, data, mask, self.config)
 
-        # --- 2. Cross-scale contrastive regularization (granular-ball) ---
+        # --- 2. Staged regularization ---
+        epoch = self.config.train.epoch
+        gate_warmup = getattr(self.config.train, 'gate_warmup_epoch', 10)
+        contrastive_warmup = getattr(self.config.train, 'contrastive_warmup_epoch', 20)
+
         gb_weight = getattr(self.config.train, 'gb_weight', 0.0)
         gb_loss_val = 0.0
-        if gb_weight > 0 and getattr(data, 'num_graphs', 1) >= 2:
-            gb_loss = self._compute_contrastive_reg(data)
-            gb_loss_val = gb_loss.item()
-            cls_loss = cls_loss + gb_weight * gb_loss
+        gate_cons_val = 0.0
+        site_adv_val = 0.0
+
+        # Stage 1 (epoch < gate_warmup): only cls + sparse gate reg (via loss_postprocess)
+        # Stage 2 (gate_warmup <= epoch < contrastive_warmup): + gate_cons + site_adv
+        # Stage 3 (epoch >= contrastive_warmup): + contrastive (VICReg)
+
+        if epoch >= gate_warmup and gb_weight > 0 and getattr(data, 'num_graphs', 1) >= 2:
+            reg_dict = self._compute_contrastive_reg(data)
+
+            # Gate consistency (stage 2+)
+            gate_cons_w = getattr(self.config.ood, 'gate_cons_weight', 0.1)
+            if gate_cons_w > 0:
+                gate_cons_val = reg_dict['gate_cons_loss'].item()
+                cls_loss = cls_loss + gate_cons_w * reg_dict['gate_cons_loss']
+
+            # Site adversarial (stage 2+)
+            site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
+            if site_adv_w > 0 and reg_dict['site_adv_loss'].item() > 0:
+                site_adv_val = reg_dict['site_adv_loss'].item()
+                cls_loss = cls_loss + site_adv_w * reg_dict['site_adv_loss']
+
+            # Contrastive VICReg (stage 3 only)
+            if epoch >= contrastive_warmup:
+                gb_loss_val = reg_dict['gb_loss'].item()
+                cls_loss = cls_loss + gb_weight * reg_dict['gb_loss']
 
         cls_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
 
         # Store for logging
-        self.ood_algorithm.spec_loss = gb_loss_val if gb_weight > 0 else None
+        if gb_weight > 0:
+            self.ood_algorithm.spec_loss = {
+                'GB': gb_loss_val,
+                'GateCons': gate_cons_val,
+                'SiteAdv': site_adv_val,
+            }
+        else:
+            self.ood_algorithm.spec_loss = None
 
         return {'loss': cls_loss.detach()}
 
@@ -292,7 +372,10 @@ class Pipeline:
             raw_preds = self.ood_algorithm.output_postprocess(model_output)
 
             # --------------- Loss collection ------------------
-            loss: torch.tensor = self.config.metric.loss_func(raw_preds, targets, reduction='none') * mask
+            # Squeeze for cross_entropy compatibility
+            t = targets.squeeze(-1) if targets.dim() > 1 and targets.shape[-1] == 1 else targets
+            m = mask.squeeze(-1) if mask.dim() > 1 and mask.shape[-1] == 1 else mask
+            loss: torch.tensor = self.config.metric.loss_func(raw_preds, t, reduction='none') * m
             mask_all.append(mask)
             loss_all.append(loss)
 

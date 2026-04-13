@@ -1,12 +1,11 @@
 includes:
   - base.yaml
 model:
-  model_name: GDGMTvGIN #
+  model_name: GDGMTvGIN
   calib_gate_init: -3.0
 ood:
-  # ood_alg: BrainOOD
-  ood_param: 0.0    # info loss coefficient
-  trade_off: 0.5    # trade-off coefficient
+  ood_param: 0.0
+  trade_off: 0.5
   diffusion_trade_off: 0.5
   entropy_trade_off: 0.01
   feature_dropout: 0.5
@@ -14,22 +13,23 @@ ood:
   variance_weight: 0.5
   covariance_weight: 0.02
   gate_sparsity_weight: 0.01
+  affine_reg_weight: 0.01
+  gate_cons_weight: 0.1
+  site_adv_weight: 0.1
   extra_param:
-    - "bern"    # sampling method
-    - 20      # decay_interval
-    - 0.7     # final_r
-    - 5    # sample_rounds
+    - "bern"
+    - 20
+    - 0.7
+    - 3
 train:
-  max_epoch: 50
-  pre_epoch: 20
-  pretrain_bs: 32
-  lr: 2e-3
-  pre_lr: 5e-4
+  max_epoch: 100
+  lr: 1e-3
+  weight_decay: 1e-3
   ball_r: 0.5
-  gb_weight: 0.3
-  orig_edge_drop: 0.05
-  coarse_edge_drop: 0.20
-  orig_feature_mask: 0.05
-  coarse_feature_mask: 0.20
-  orig_noise_std: 0.01
-  coarse_noise_std: 0.03
+  gb_weight: 0.1
+  label_smoothing: 0.05
+  patience: 20
+  classifier_dropout: 0.5
+  # Staged training: epoch thresholds
+  gate_warmup_epoch: 10
+  contrastive_warmup_epoch: 20

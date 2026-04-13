@@ -136,7 +136,8 @@ class GBGMT(GNNBasic):
         # # 多次采样取平均,通过边概率控制哪些结构重要
         while len(sampling_logits)<sampling_trials:
             x_out, diff_loss = self.gnn(*args, **kwargs)
-            sampling_logits.append(self.classifier(x_out))
+            x_out_drop = self.classifier_dropout(x_out) if self.training else x_out
+            sampling_logits.append(self.classifier(x_out_drop))
         logits = torch.stack(sampling_logits).mean(dim=0)
 
         return logits
@@ -197,6 +198,8 @@ class GDGMT(GNNBasic):
         # ----------------origin---------------使用GAT
         self.gnn = GATFeatExtractor(config)
         self.classifier = Classifier(config)
+        self.classifier_dropout = nn.Dropout(
+            p=getattr(config.train, 'classifier_dropout', 0.5))
         self.learn_edge_att = True
         self.sampling_method = config.ood.extra_param[0]
         self.sampling_rounds = config.ood.extra_param[3]
@@ -205,23 +208,28 @@ class GDGMT(GNNBasic):
         self.causal_adj = None
         self.diffusion_loss = 0.0
         self.entropy_loss = 0.0
-        # Projection head: wider hidden, BN only in middle (not output)
-        proj_dim = config.model.dim_hidden * 2
+        # Projection head: lightweight, no BN (small batch + multi-site)
         self.proj_head = nn.Sequential(
-            nn.Linear(config.model.dim_hidden, proj_dim),
-            nn.BatchNorm1d(proj_dim),
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(proj_dim, config.model.dim_hidden)
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
         )
         self.mode = 'finetune'
 
         # Sample-level site calibration (placed before GNN)
         calib_dim = lstm_hidden_size if self.use_cnn else config.dataset.dim_node
+        # num_sites must cover max env_id + 1 (env_ids may not be contiguous)
+        num_sites = getattr(config.dataset, 'num_envs', 0) or 0
+        # Safety: dataset may have non-contiguous site IDs (e.g., 0..16 with gaps)
+        # Use a generous upper bound; extra unused classes don't hurt
+        num_sites = max(num_sites, 20) if num_sites > 0 else 0
         self.site_calibration = SiteCalibration(
             feat_dim=calib_dim,
             gate_init_bias=getattr(config.model, 'calib_gate_init', -3.0),
+            num_sites=num_sites,
         )
-        self.calib_gate_reg = 0.0  # updated each forward, used for loss
+        self.calib_gate_reg = 0.0   # scalar, updated each forward
+        self.calib_info = {}        # dict with gamma/beta/gate, updated each forward
 
     def forward(self, *args, **kwargs):
         r"""
@@ -253,8 +261,9 @@ class GDGMT(GNNBasic):
         # --- Site calibration (always applied, before GNN) ---
         batch_idx = data.batch if data.batch is not None else torch.zeros(
             node_features.size(0), dtype=torch.long, device=node_features.device)
-        node_features, gate_reg = self.site_calibration(node_features, batch_idx)
-        self.calib_gate_reg = gate_reg
+        node_features, calib_info = self.site_calibration(node_features, batch_idx)
+        self.calib_gate_reg = calib_info['gate_reg']
+        self.calib_info = calib_info
 
         # --- Pretrain mode: projection head for contrastive learning ---
         if self.mode == 'pretrain':
@@ -272,7 +281,8 @@ class GDGMT(GNNBasic):
                 x_out, diff_loss = self.gnn(node_features, *args, **kwargs)
             else:
                 x_out, diff_loss = self.gnn(*args, **kwargs)
-            sampling_logits.append(self.classifier(x_out))
+            x_out_drop = self.classifier_dropout(x_out) if self.training else x_out
+            sampling_logits.append(self.classifier(x_out_drop))
         logits = torch.stack(sampling_logits).mean(dim=0)
         return logits, None, None
 

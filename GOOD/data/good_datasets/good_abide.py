@@ -82,7 +82,7 @@ class GOODABIDE(InMemoryDataset):
         self.mol_name = 'ABIDE'
         self.domain = domain
         self.metric = 'Accuracy'
-        self.task = 'Binary classification'
+        self.task = 'Multi-label classification'
         self.url = ''
 
         self.generate = generate
@@ -287,8 +287,7 @@ def dgl_to_pyg(graph, y, domain):
     x = graph.ndata['feat']
     edge_index = torch.stack(graph.edges()).contiguous()
     edge_weight = graph.edata['feat'].float()
-    yy = torch.zeros(1, 2)
-    yy[0][y] = 1
-    data = Data(x=x.float(), edge_index=edge_index, edge_weight=edge_weight, y=yy, domain=domain)
+    data = Data(x=x.float(), edge_index=edge_index, edge_weight=edge_weight,
+                y=torch.tensor([y], dtype=torch.long), domain=domain)
     data.env_id = domain
     return data

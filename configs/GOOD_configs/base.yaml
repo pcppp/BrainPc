@@ -21,9 +21,10 @@ train:
 model:
   cnn_out_channels: 128
   lstm_hidden_size: 128
-  dim_hidden: 100
-  dim_ffn: 100
-  dropout_rate: 0.5
+  dim_hidden: 64
+  dim_ffn: 64
+  num_layer: 2
+  dropout_rate: 0.3
   use_cnn: False
 dataset:
   dataloader_name: BaseDataLoader

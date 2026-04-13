@@ -93,14 +93,15 @@ class BrainOOD(BaseOODAlg):
 
         self.mean_loss = loss.mean()
 
-        # Gate sparsity regularization from SiteCalibration
-        gate_lambda = getattr(config.ood, 'gate_sparsity_weight', 0.01)
-        if gate_lambda > 0 and hasattr(self.model, 'calib_gate_reg'):
-            import torch as _torch
-            gate_reg = self.model.calib_gate_reg
-            if isinstance(gate_reg, (int, float)):
-                gate_reg = _torch.tensor(gate_reg, device=self.mean_loss.device)
-            self.mean_loss = self.mean_loss + gate_lambda * gate_reg
+        # Gate sparsity + affine regularization from SiteCalibration
+        if hasattr(self.model, 'calib_info') and self.model.calib_info:
+            ci = self.model.calib_info
+            gate_lambda = getattr(config.ood, 'gate_sparsity_weight', 0.01)
+            affine_lambda = getattr(config.ood, 'affine_reg_weight', 0.01)
+            if gate_lambda > 0:
+                self.mean_loss = self.mean_loss + gate_lambda * ci['gate_reg']
+            if affine_lambda > 0:
+                self.mean_loss = self.mean_loss + affine_lambda * ci['affine_reg']
 
         return self.mean_loss
 

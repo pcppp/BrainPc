@@ -158,8 +158,11 @@ class BaseOODAlg(ABC):
             return contrastive_loss
 
         else:
-            loss = config.metric.loss_func(raw_pred, targets, reduction='none') * mask
-            loss = loss * node_norm * mask.sum() if config.model.model_level == 'node' else loss
+            # Squeeze targets from [B,1] to [B] for F.cross_entropy
+            t = targets.squeeze(-1) if targets.dim() > 1 and targets.shape[-1] == 1 else targets
+            m = mask.squeeze(-1) if mask.dim() > 1 and mask.shape[-1] == 1 else mask
+            loss = config.metric.loss_func(raw_pred, t, reduction='none') * m
+            loss = loss * node_norm * m.sum() if config.model.model_level == 'node' else loss
             return loss
    
     def calculate_contrastive_loss(self, features, temperature: float = 0.05, labels=None):

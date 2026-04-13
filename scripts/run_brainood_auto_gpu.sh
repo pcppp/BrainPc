@@ -10,7 +10,6 @@ shift || true
 MIN_FREE_MB="${MIN_FREE_MB:-20000}"
 MAX_USED_MB="${MAX_USED_MB:-500}"
 MAX_UTIL="${MAX_UTIL:-10}"
-LOCK_FILE="${LOCK_FILE:-/tmp/$(basename "$REPO_ROOT" | tr "[:upper:]" "[:lower:]" | tr -cs "a-z0-9" "-")-auto-gpu.lock}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "#E# nvidia-smi not found."
@@ -23,41 +22,6 @@ if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
   conda activate pc2 >/dev/null 2>&1 || true
 fi
 
-cleanup_blocking_launcher() {
-  local pids pid pid_line repo_tag
-  repo_tag="$(basename "$REPO_ROOT")"
-  pids="$(fuser "$LOCK_FILE" 2>/dev/null || true)"
-  if [ -z "$pids" ]; then
-    return 1
-  fi
-
-  echo "#W# Lock file is busy. Attempting to stop the previous validation launcher: $pids"
-  for pid in $pids; do
-    pid_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    case "$pid_line" in
-      *run_brainood_auto_gpu.sh*|*GOOD.kernel.main*)
-        if printf "%s" "$pid_line" | grep -Fq "$repo_tag"; then
-          kill "$pid" 2>/dev/null || true
-        fi
-        ;;
-    esac
-  done
-  sleep 2
-  return 0
-}
-
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  cleanup_blocking_launcher || {
-    echo "#E# Another auto-gpu launcher is selecting a device. Retry in a few seconds."
-    exit 1
-  }
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    echo "#E# Another auto-gpu launcher is still holding the device-selection lock after cleanup."
-    exit 1
-  fi
-fi
 
 QUERY_OUT="$(nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits)"
 BEST_LINE="$(printf '%s\n' "$QUERY_OUT" | awk -F', *' -v min_free="$MIN_FREE_MB" -v max_used="$MAX_USED_MB" -v max_util="$MAX_UTIL" '

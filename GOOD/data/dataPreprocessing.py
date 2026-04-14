@@ -257,7 +257,7 @@ def construct_dataset(dataName, edge_ratio, node_feat_transform='timeseries', to
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Construct brain graph bins from schaefer100 files.')
     parser.add_argument('--datasets', nargs='+', default=['abide'], help='Dataset names under GOOD/data/dataset.')
-    parser.add_argument('--edge-ratio', type=float, default=0.2)
+    parser.add_argument('--edge-ratio', type=float, default=1.0)
     parser.add_argument('--node-feat-transform', default='timeseries')
     parser.add_argument('--topk-per-node', type=int, default=4)
     args = parser.parse_args()

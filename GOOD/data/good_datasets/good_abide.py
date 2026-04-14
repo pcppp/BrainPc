@@ -148,7 +148,7 @@ class GOODABIDE(InMemoryDataset):
         meta_info.model_level = 'graph'
         meta_info.num_node_features = None
         meta_info.name = 'abide_full_ood_schaefer100'
-        meta_info.edge_ratio = 0.2
+        meta_info.edge_ratio = -1  # soft edges, no hard threshold
         meta_info.node_feat_transform = 'precomputed'
         
         with open('./GOOD/data/good_datasets/abide_full_ood_schaefer100/meta.json', 'r') as f:
@@ -208,6 +208,8 @@ class GOODABIDE(InMemoryDataset):
                     G_dataset[i].ndata['feat'] = G_dataset[i].ndata['N_features'].clone()
 
         all_idx = get_all_split_idx(meta_info.name)
+        # Fit PCA on all subjects (unsupervised) before converting to PyG
+        fit_pca_on_all(G_dataset)
         train_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['train'][fold]]
         id_val_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['id_val'][fold]]
         id_test_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['id_test'][fold]]
@@ -227,7 +229,8 @@ class GOODABIDE(InMemoryDataset):
         test_dataset = GOODABIDE(root=dataset_root,
                                domain=domain, shift=shift, subset='test', generate=generate, data_list=test_data)
 
-        meta_info.num_node_features = int(G_dataset[0].ndata['feat'].shape[-1])
+        # Use actual x dim from converted PyG data (may differ from raw due to PCA)
+        meta_info.num_node_features = int(train_data[0].x.shape[-1])
         meta_info.dim_node = meta_info.num_node_features
         meta_info.dim_edge = 0 #train_dataset.num_edge_features
 
@@ -283,10 +286,71 @@ def get_all_split_idx(name):
 
 
 
+def _shrink_fc(fc_matrix):
+    """Apply Ledoit-Wolf shrinkage to a correlation matrix for stable edge estimation.
+    
+    Shrinks toward the identity: S_shrunk = (1-alpha)*S + alpha*I
+    """
+    n = fc_matrix.shape[0]
+    mu = fc_matrix.trace() / n
+    alpha = 0.3  # moderate shrinkage
+    target = mu * torch.eye(n, device=fc_matrix.device)
+    fc_shrunk = (1 - alpha) * fc_matrix + alpha * target
+    fc_shrunk.fill_diagonal_(0.0)
+    return fc_shrunk
+
+
+# Global PCA components, fitted once on all subjects
+_pca_components = None
+_pca_mean = None
+_PCA_DIM = 32
+
+
+def fit_pca_on_all(G_dataset):
+    """Fit PCA on FC features of all subjects (unsupervised, no label leakage)."""
+    global _pca_components, _pca_mean
+    import numpy as np
+    
+    all_fc = []
+    for g in G_dataset:
+        fc = g.ndata['FC_features'].numpy()  # [100, 100]
+        all_fc.append(fc)
+    
+    # Stack all FC rows: [N_subjects * 100, 100]
+    all_rows = np.concatenate(all_fc, axis=0)  # [102500, 100]
+    
+    # PCA via SVD
+    _pca_mean = all_rows.mean(axis=0)
+    centered = all_rows - _pca_mean
+    U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    _pca_components = Vt[:_PCA_DIM].T  # [100, 32]
+    
+    explained = (S[:_PCA_DIM]**2).sum() / (S**2).sum()
+    print(f'#IN#PCA fitted: {all_rows.shape[1]} -> {_PCA_DIM}, explained variance: {explained:.4f}')
+
+
+def _apply_pca(fc_rows):
+    """Project FC rows [100, 100] -> [100, 32] using fitted PCA."""
+    centered = fc_rows - torch.from_numpy(_pca_mean).float()
+    projected = centered @ torch.from_numpy(_pca_components).float()
+    return projected
+
+
 def dgl_to_pyg(graph, y, domain):
-    x = graph.ndata['feat']
-    edge_index = torch.stack(graph.edges()).contiguous()
-    edge_weight = graph.edata['feat'].float()
+    # --- Node features: PCA-reduced FC rows ---
+    fc = graph.ndata['FC_features'].clone()  # [100, 100]
+    x = _apply_pca(fc)  # [100, 32]
+    
+    # --- Edge construction: soft shrinkage FC, no hard threshold ---
+    fc_shrunk = _shrink_fc(fc)
+    
+    edge_thresh = 0.05
+    mask = fc_shrunk.abs() > edge_thresh
+    mask.fill_diagonal_(False)
+    src, dst = mask.nonzero(as_tuple=True)
+    edge_index = torch.stack([src, dst], dim=0)
+    edge_weight = fc_shrunk[src, dst].unsqueeze(-1)
+    
     data = Data(x=x.float(), edge_index=edge_index, edge_weight=edge_weight,
                 y=torch.tensor([y], dtype=torch.long), domain=domain)
     data.env_id = domain

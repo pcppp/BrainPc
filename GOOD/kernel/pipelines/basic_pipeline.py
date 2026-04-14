@@ -46,37 +46,41 @@ class Pipeline:
         self.config: Union[CommonArgs, Munch] = config
 
     @staticmethod
-    def _vicreg_loss(z1, z2, sim_weight=1.0, var_weight=1.0, cov_weight=0.02):
-        """VICReg-style loss: invariance + variance + covariance.
-        Better than InfoNCE for small sample sizes (no hard negatives).
-        """
-        # Invariance: MSE between paired embeddings
-        inv_loss = torch.nn.functional.mse_loss(z1, z2)
+    def _vicreg_loss(z_teacher, z_student, sim_weight=1.0, var_weight=1.0, cov_weight=0.02):
+        """Asymmetric VICReg: granular-ball distills from original graph.
 
-        # Variance: hinge loss to keep std above 1 (prevent collapse)
+        - Invariance: MSE(sg(z_teacher), z_student)  — teacher is stop-grad
+        - Variance/Covariance: only on z_student (prevent collapse of student)
+        """
+        # Invariance: student matches stop-grad teacher
+        inv_loss = torch.nn.functional.mse_loss(z_student, z_teacher.detach())
+
+        # Variance: only on student branch (teacher is frozen, no collapse risk)
         def var_term(z):
             std = z.std(dim=0)
             return torch.relu(1.0 - std).mean()
-        var_loss = var_term(z1) + var_term(z2)
+        var_loss = var_term(z_student)
 
-        # Covariance: off-diagonal covariance should be zero
+        # Covariance: only on student branch
         def cov_term(z):
             n = z.size(0)
             z_centered = z - z.mean(dim=0)
             cov = (z_centered.T @ z_centered) / max(n - 1, 1)
             off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
             return off_diag / z.size(1)
-        cov_loss = cov_term(z1) + cov_term(z2)
+        cov_loss = cov_term(z_student)
 
         return sim_weight * inv_loss + var_weight * var_loss + cov_weight * cov_loss
 
     def _compute_contrastive_reg(self, data: Batch) -> dict:
         """Cross-scale contrastive regularization using VICReg-style loss.
 
-        Returns dict with gb_loss, gate_cons_loss, site_adv_loss.
+        Calibration params (gamma, beta, gate) are estimated ONCE from the original
+        graph and shared to the granular-ball view, avoiding scale-mismatch artifacts.
+
+        Returns dict with gb_loss, site_adv_loss.
         """
         from GOOD.data.gb import build_granular_ball_view
-        from GOOD.networks.models.SiteCalibration import SiteCalibration as SC
 
         graph_list = data.to_data_list()
         ball_r = getattr(self.config.train, 'ball_r', 0.5)
@@ -85,8 +89,10 @@ class Pipeline:
         view_gb = Batch.from_data_list(coarse_graphs).to(self.config.device)
         view_orig = Batch.from_data_list([g.clone() for g in graph_list]).to(self.config.device)
 
-        emb_orig, calib_orig = self._extract_graph_embedding(view_orig, return_calib_info=True)
-        emb_gb, calib_gb = self._extract_graph_embedding(view_gb, return_calib_info=True)
+        # Estimate calibration params from original graph only
+        emb_orig, calib_info = self._extract_graph_embedding(view_orig, return_calib_info=True)
+        # Apply the SAME params to granular-ball view
+        emb_gb = self._extract_graph_embedding_shared_calib(view_gb, calib_info)
 
         proj_orig = self.model.proj_head(emb_orig)
         proj_gb = self.model.proj_head(emb_gb)
@@ -95,11 +101,9 @@ class Pipeline:
         var_w = getattr(self.config.ood, 'variance_weight', 0.5)
         cov_w = getattr(self.config.ood, 'covariance_weight', 0.02)
         gb_loss = self._vicreg_loss(proj_orig, proj_gb,
-                                     sim_weight=1.0, var_weight=var_w, cov_weight=cov_w)
+                                     sim_weight=1.0, var_weight=var_w, cov_weight=cov_w)  # orig=teacher(sg), gb=student
 
-        gate_cons_loss = SC.gate_consistency_loss(calib_orig, calib_gb)
-
-        # Site adversarial loss
+        # Site adversarial loss (on original graph calibrated features)
         site_adv_loss = torch.tensor(0.0, device=data.x.device)
         if (self.model.site_calibration.site_classifier is not None
                 and hasattr(view_orig, 'env_id')):
@@ -117,7 +121,6 @@ class Pipeline:
 
         return {
             'gb_loss': gb_loss,
-            'gate_cons_loss': gate_cons_loss,
             'site_adv_loss': site_adv_loss,
         }
 
@@ -153,6 +156,31 @@ class Pipeline:
             return graph_emb, calib_info
         return graph_emb
 
+    def _extract_graph_embedding_shared_calib(self, data: Batch, calib_info: dict) -> torch.Tensor:
+        """Extract graph embedding using pre-computed calibration params.
+
+        Instead of running SiteCalibration.forward() (which re-estimates stats),
+        uses apply_params() with the gamma/beta/gate from the original graph.
+        """
+        model = self.model
+        if model.use_cnn:
+            x = data.x.unsqueeze(1)
+            x = model.cnn(x)
+            x = model.pool(x)
+            x = x.transpose(1, 2)
+            lstm_out, _ = model.lstm(x)
+            node_features = lstm_out[:, -1, :]
+        else:
+            node_features = data.x
+
+        batch_idx = data.batch if data.batch is not None else torch.zeros(
+            node_features.size(0), dtype=torch.long, device=node_features.device)
+        node_features = model.site_calibration.apply_params(
+            node_features, batch_idx,
+            calib_info['gamma'], calib_info['beta'], calib_info['gate'])
+        graph_emb, _ = model.gnn(node_features, data=data, ood_algorithm=self.ood_algorithm)
+        return graph_emb
+
     def train_batch(self, data: Batch, pbar) -> dict:
         r"""
         Train a batch: classification loss + cross-scale contrastive regularization.
@@ -184,7 +212,6 @@ class Pipeline:
 
         gb_weight = getattr(self.config.train, 'gb_weight', 0.0)
         gb_loss_val = 0.0
-        gate_cons_val = 0.0
         site_adv_val = 0.0
 
         # Stage 1 (epoch < gate_warmup): only cls + sparse gate reg (via loss_postprocess)
@@ -193,12 +220,6 @@ class Pipeline:
 
         if epoch >= gate_warmup and gb_weight > 0 and getattr(data, 'num_graphs', 1) >= 2:
             reg_dict = self._compute_contrastive_reg(data)
-
-            # Gate consistency (stage 2+)
-            gate_cons_w = getattr(self.config.ood, 'gate_cons_weight', 0.1)
-            if gate_cons_w > 0:
-                gate_cons_val = reg_dict['gate_cons_loss'].item()
-                cls_loss = cls_loss + gate_cons_w * reg_dict['gate_cons_loss']
 
             # Site adversarial (stage 2+)
             site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
@@ -219,7 +240,6 @@ class Pipeline:
         if gb_weight > 0:
             self.ood_algorithm.spec_loss = {
                 'GB': gb_loss_val,
-                'GateCons': gate_cons_val,
                 'SiteAdv': site_adv_val,
             }
         else:
@@ -467,10 +487,11 @@ class Pipeline:
                       f'ID Validation Loss: {id_ckpt["id_val_loss"].item():.4f}\n'
                       f'ID Test {self.config.metric.score_name}: {id_ckpt["id_test_score"]:.4f}\n'
                       f'ID Test Loss: {id_ckpt["id_test_loss"].item():.4f}\n'
-                      f'OOD Validation {self.config.metric.score_name}: {id_ckpt["val_score"]:.4f}\n'
+                      f'OOD Validation {self.config.metric.score_name}: {id_ckpt["ood_val_score"]:.4f}\n'
                       f'OOD Validation Loss: {id_ckpt["ood_val_loss"].item():.4f}\n'
-                      f'OOD Test {self.config.metric.score_name}: {id_ckpt["test_score"]:.4f}\n'
-                      f'OOD Test Loss: {id_ckpt["ood_test_loss"].item():.4f}\n')
+                      f'OOD Test {self.config.metric.score_name}: {id_ckpt["ood_test_score"]:.4f}\n'
+                      f'OOD Test Loss: {id_ckpt["ood_test_loss"].item():.4f}\n'
+                      f'Mixed(ID+OOD) Val: {id_ckpt["val_score"]:.4f}, Test: {id_ckpt["test_score"]:.4f}\n')
                 print(f'#IN#Loading best Out-of-Domain Checkpoint {ckpt["epoch"]}...')
                 print(f'#IN#Checkpoint {ckpt["epoch"]}: \n-----------------------------------\n'
                       f'Train {self.config.metric.score_name}: {ckpt["train_score"]:.4f}\n'
@@ -479,10 +500,11 @@ class Pipeline:
                       f'ID Validation Loss: {ckpt["id_val_loss"].item():.4f}\n'
                       f'ID Test {self.config.metric.score_name}: {ckpt["id_test_score"]:.4f}\n'
                       f'ID Test Loss: {ckpt["id_test_loss"].item():.4f}\n'
-                      f'OOD Validation {self.config.metric.score_name}: {ckpt["val_score"]:.4f}\n'
+                      f'OOD Validation {self.config.metric.score_name}: {ckpt["ood_val_score"]:.4f}\n'
                       f'OOD Validation Loss: {ckpt["ood_val_loss"].item():.4f}\n'
-                      f'OOD Test {self.config.metric.score_name}: {ckpt["test_score"]:.4f}\n'
-                      f'OOD Test Loss: {ckpt["ood_test_loss"].item():.4f}\n')
+                      f'OOD Test {self.config.metric.score_name}: {ckpt["ood_test_score"]:.4f}\n'
+                      f'OOD Test Loss: {ckpt["ood_test_loss"].item():.4f}\n'
+                      f'Mixed(ID+OOD) Val: {ckpt["val_score"]:.4f}, Test: {ckpt["test_score"]:.4f}\n')
 
                 print(f'#IN#ChartInfo {id_ckpt["id_test_score"]:.4f} {id_ckpt["test_score"]:.4f} '
                       f'{ckpt["id_test_score"]:.4f} {ckpt["test_score"]:.4f} {ckpt["val_score"]:.4f}', end='')
@@ -551,9 +573,11 @@ class Pipeline:
             'ood_test_recall': test_stat['recall'],
             'ood_test_f1': test_stat['f1'],
             'ood_test_roc_auc': test_stat['roc_auc'],
-            'val_score': (val_stat['score'] * val_stat['subject_num'] + id_val_stat['score'] * id_val_stat['subject_num']) / (
+            'val_score': val_stat['score'],
+            'test_score': test_stat['score'],
+            'mixed_val_score': (val_stat['score'] * val_stat['subject_num'] + id_val_stat['score'] * id_val_stat['subject_num']) / (
                     val_stat['subject_num'] + id_val_stat['subject_num']),
-            'test_score': (test_stat['score'] * test_stat['subject_num'] + id_test_stat['score'] * id_test_stat['subject_num']) / (
+            'mixed_test_score': (test_stat['score'] * test_stat['subject_num'] + id_test_stat['score'] * id_test_stat['subject_num']) / (
                     test_stat['subject_num'] + id_test_stat['subject_num']),
             'id_val_subject_num': id_val_stat['subject_num'],
             'id_test_subject_num': id_test_stat['subject_num'],

@@ -132,6 +132,43 @@ class SiteCalibration(nn.Module):
 
         return H_calibrated, calib_info
 
+    def apply_params(self, H: torch.Tensor, batch: torch.Tensor,
+                     gamma: torch.Tensor, beta: torch.Tensor, gate: torch.Tensor):
+        """Apply pre-computed calibration params to a different view.
+
+        Used to share the same calibration (estimated from original graph)
+        with the granular-ball coarse view, avoiding scale-mismatch artifacts.
+
+        Args:
+            H: node features [N_total, feat_dim] of the target view
+            batch: batch indicator [N_total]
+            gamma, beta, gate: [num_graphs, feat_dim] from a prior forward() call
+        """
+        num_graphs = int(batch.max().item()) + 1
+
+        # Per-node stats from the target view (for normalization only)
+        graph_mean = torch.zeros(num_graphs, self.feat_dim, device=H.device)
+        graph_count = torch.zeros(num_graphs, 1, device=H.device)
+        graph_count.index_add_(0, batch, torch.ones(H.size(0), 1, device=H.device))
+        graph_mean.index_add_(0, batch, H.detach())
+        graph_mean = graph_mean / graph_count.clamp(min=1)
+
+        graph_sq = torch.zeros(num_graphs, self.feat_dim, device=H.device)
+        graph_sq.index_add_(0, batch, (H.detach()) ** 2)
+        graph_sq = graph_sq / graph_count.clamp(min=1)
+        graph_std = (graph_sq - graph_mean ** 2).clamp(min=1e-6).sqrt()
+
+        # Broadcast to node level
+        gamma_n = gamma[batch]
+        beta_n = beta[batch]
+        gate_n = gate[batch]
+        mean_n = graph_mean[batch]
+        std_n = graph_std[batch]
+
+        H_norm = (H - mean_n) / (std_n + 1e-6)
+        H_calibrated = H + gate_n * (gamma_n * H_norm + beta_n - H)
+        return H_calibrated
+
     def site_adversarial_loss(self, H_calibrated, batch, site_labels, grl_lambda=1.0):
         """Site adversarial loss on calibrated features (gradient reversal)."""
         if self.site_classifier is None:

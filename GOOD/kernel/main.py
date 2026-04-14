@@ -70,8 +70,8 @@ def compute_10fold_metrics(ckpts):
         id_test_scores.append(ckpt['id_test_score'])
         ood_val_scores.append(ckpt['ood_val_score'])
         ood_test_scores.append(ckpt['ood_test_score'])
-        val_scores.append(ckpt['val_score'])
-        test_scores.append(ckpt['test_score'])
+        val_scores.append(ckpt.get('mixed_val_score', ckpt['val_score']))
+        test_scores.append(ckpt.get('mixed_test_score', ckpt['test_score']))
 
     # compute the mean and std of these metrics, keep four decimal places
     train_mean = torch.mean(torch.tensor(train_scores))

@@ -192,9 +192,6 @@ class GDGMT(GNNBasic):
             self.dropout = nn.Dropout(p=0.3)
             # 修改 config 中的 dim_node 为 CNN 输出维度
             config.dataset.dim_node = cnn_out_channels
-        # ----------------origin---------------使用GIN
-        # self.gnn = DGINFeatExtractor(config)
-        # self.extractor = ExtractorMLP(config) # 边特征提取器
         # ----------------origin---------------使用GAT
         self.gnn = GATFeatExtractor(config)
         self.classifier = Classifier(config)
@@ -256,7 +253,7 @@ class GDGMT(GNNBasic):
             if self.mode != 'pretrain':
                 node_features = self.dropout(node_features)
         else:
-            node_features = data.x  # GNN directly uses node features
+            node_features = data.x  # PCA-reduced FC features
 
         # --- Site calibration (always applied, before GNN) ---
         batch_idx = data.batch if data.batch is not None else torch.zeros(

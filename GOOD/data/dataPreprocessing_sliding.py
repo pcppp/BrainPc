@@ -125,7 +125,7 @@ def _select_node_features(node_feats: np.ndarray, fc_matrix: np.ndarray, node_fe
     raise NotImplementedError(f"Unsupported node_feat_transform: {node_feat_transform}")
 
 def construct_dataset(dataName,
-                      edge_ratio=0.2,
+                      edge_ratio=1.0,
                       node_feat_transform='timeseries',
                       use_wavelet=False,
                       topk_per_node=None):
@@ -277,7 +277,7 @@ def construct_dataset(dataName,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Construct sliding brain graph bins from schaefer100 files.')
     parser.add_argument('--datasets', nargs='+', default=['abide'], help='Dataset names under GOOD/data/dataset.')
-    parser.add_argument('--edge-ratio', type=float, default=0.2)
+    parser.add_argument('--edge-ratio', type=float, default=1.0)
     parser.add_argument('--node-feat-transform', default='timeseries')
     parser.add_argument('--use-wavelet', action='store_true')
     parser.add_argument('--topk-per-node', type=int, default=None)

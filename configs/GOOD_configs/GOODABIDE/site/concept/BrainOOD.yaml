@@ -26,7 +26,7 @@ train:
   lr: 1e-3
   weight_decay: 1e-3
   ball_r: 0.5
-  gb_weight: 0.1
+  gb_weight: 0.02
   label_smoothing: 0.05
   patience: 20
   classifier_dropout: 0.5

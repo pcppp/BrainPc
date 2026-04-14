@@ -46,12 +46,29 @@ class BaseOODAlg(ABC):
             self.model.set_mode(mode)
         
         # 2. 确定当前阶段的学习率
-        # 通常微调阶段(finetune)的学习率比预训练要小，或者在 config 里区分配置
-        lr = config.train.pre_lr
-        t_epochs = config.train.pre_epoch
-        if mode == 'finetune' and hasattr(config.train, 'lr'):
-            lr = config.train.lr
-            t_epochs = config.train.max_epoch
+        # 兼容两种配置:
+        # - 双阶段: pre_lr/pre_epoch + lr/max_epoch
+        # - 单阶段: 仅提供 lr/max_epoch，但依然走 finetune 流程
+        if mode == 'finetune':
+            lr = getattr(config.train, 'lr', None)
+            t_epochs = getattr(config.train, 'max_epoch', None)
+            if lr is None:
+                lr = getattr(config.train, 'pre_lr', None)
+            if t_epochs is None:
+                t_epochs = getattr(config.train, 'pre_epoch', None)
+        else:
+            lr = getattr(config.train, 'pre_lr', None)
+            t_epochs = getattr(config.train, 'pre_epoch', None)
+            if lr is None:
+                lr = getattr(config.train, 'lr', None)
+            if t_epochs is None:
+                t_epochs = getattr(config.train, 'max_epoch', None)
+
+        if lr is None or t_epochs is None:
+            raise AttributeError(
+                f'Missing learning-rate or epoch config for stage "{mode}". '
+                'Expected train.lr/max_epoch or train.pre_lr/pre_epoch.'
+            )
         
         # 3. 【关键】重置优化器
         # 因为参数变了 (ProjectionHead vs ClassifierHead)，必须重新注册 parameters

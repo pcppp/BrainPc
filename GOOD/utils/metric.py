@@ -5,7 +5,8 @@ from math import sqrt
 
 import torch
 from sklearn.metrics import roc_auc_score as sk_roc_auc, mean_squared_error, \
-    accuracy_score, average_precision_score, mean_absolute_error, f1_score, precision_score, recall_score
+    accuracy_score, average_precision_score, mean_absolute_error, f1_score, precision_score, recall_score, \
+    balanced_accuracy_score
 from torch.nn.functional import cross_entropy, l1_loss, binary_cross_entropy_with_logits
 
 
@@ -116,28 +117,25 @@ class Metric(object):
 
     def roc_auc_score(self, y_true, y_pred):
         r"""
-        Calculate roc_auc score
-
-        Args:
-            y_true (torch.tensor): input labels
-            y_pred (torch.tensor): label predictions
-
-        Returns (float):
-            roc_auc score
-
+        Calculate roc_auc score using probability scores (not rounded labels).
         """
         true = torch.tensor(y_true)
         pred_label = torch.tensor(y_pred)
-        if self.dataset_task == "Binary classification":
-            pred_label = pred_label.round()
-            return sk_roc_auc(true, pred_label)
-        else:
-            # For multi-class AUC, use softmax probabilities directly
-            try:
-                return sk_roc_auc(true, pred_label, multi_class='ovo')
-            except ValueError:
-                # Fallback if only one class in batch
-                return 0.5
+        try:
+            if self.dataset_task == "Binary classification":
+                # Use raw probabilities, not rounded
+                return sk_roc_auc(true, pred_label)
+            else:
+                # Multi-label: pred_label is [N, C] softmax probs
+                if pred_label.dim() == 2 and pred_label.shape[1] == 2:
+                    # Binary via softmax: use class-1 probability
+                    return sk_roc_auc(true, pred_label[:, 1])
+                elif pred_label.dim() == 2:
+                    return sk_roc_auc(true, pred_label, multi_class='ovo')
+                else:
+                    return sk_roc_auc(true, pred_label)
+        except ValueError:
+            return 0.5
 
     def reg_absolute_error(self, y_true, y_pred):
         r"""
@@ -226,6 +224,17 @@ class Metric(object):
 
         """
         return sqrt(mean_squared_error(y_true, y_pred))
+
+
+    def balanced_accuracy(self, y_true, y_pred):
+        """Calculate balanced accuracy (macro-averaged recall per class)."""
+        true = torch.tensor(y_true)
+        pred_label = torch.tensor(y_pred)
+        if self.dataset_task == "Binary classification":
+            pred_label = pred_label.round()
+        else:
+            pred_label = torch.argmax(pred_label, dim=1)
+        return balanced_accuracy_score(true.numpy(), pred_label.numpy())
 
     def cross_entropy_with_logit(self, y_pred: torch.Tensor, y_true: torch.Tensor, **kwargs):
         r"""

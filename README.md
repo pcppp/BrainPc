@@ -50,3 +50,22 @@ MIN_FREE_MB=16000 MAX_USED_MB=2000 MAX_UTIL=20 ./scripts/run_brainood_auto_gpu.s
 ## Contact
 
 If you have any questions, please feel free to reach out at `jiaxing003@e.ntu.edu.sg`.
+
+
+## Recent Changes (2026-04-14)
+
+### Input Representation Overhaul
+- PCA node features: Node features are now PCA(FC, 100->32) instead of raw FC rows, decoupling node features from edge information.
+- Soft edge construction: Ledoit-Wolf shrinkage covariance + |w|>0.05 threshold replaces the old top-20% hard threshold, retaining ~74% of edges.
+- Preprocessing: edge_ratio changed from 0.2 to 1.0 (complete graph) in both dataPreprocessing.py and dataPreprocessing_sliding.py.
+
+### Contrastive Learning Improvements
+- Asymmetric VICReg: Replaced InfoNCE with VICReg using stop-gradient on the original (teacher) branch; only the granular-ball (student) branch receives variance/covariance regularization.
+- Shared calibration: SiteCalibration parameters are estimated once from the original graph and applied to both original and granular-ball views via apply_params().
+- Gate-cons removal: Gate consistency loss was removed (it penalized scale difference rather than site difference).
+
+### Training Strategy (4 Strategic Decisions)
+1. Stage-2-only main results: Stage 1+2 (classifier + site calibration) produce main results; stage 3 (GB/VICReg contrastive) is ablation-only.
+2. MA5 checkpoint selection: Uses 5-epoch moving average of S_t = 0.6*BA_OOD_val + 0.2*AUROC_OOD_val + 0.2*BA_ID_val. BA (balanced accuracy) better handles low positive-ratio sites; AUROC is threshold-invariant.
+3. Local-peak top-3 ensemble: Only saves checkpoints at local S_t peaks with min 4-epoch gap for diversity, then takes top-3 by MA5. Test-time averages softmax probs with threshold tuned on OOD_val to maximize balanced accuracy.
+4. Stage-3 gating: GB/VICReg stage only enters main results if MA5 > best_stage2 + 0.02 for 3 consecutive epochs.

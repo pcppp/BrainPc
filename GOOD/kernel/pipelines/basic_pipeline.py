@@ -249,107 +249,199 @@ class Pipeline:
 
     def train(self, fold=0):
         r"""
-        Single-stage training: classification + cross-scale contrastive regularization.
-        No separate pretrain phase.
+        Training with MA3-based checkpoint selection and top-3 ensemble.
+        Stage 1+2 only for main results; stage 3 (GB/VICReg) ablation-only.
         """
-
-        # 初始化
         self.config_model('train', fold)
         self.ood_algorithm.set_up(self.model, self.config)
         self.ood_algorithm.set_stage('finetune', self.config)
         self.model.set_mode('finetune')
 
         max_epochs = self.config.train.max_epoch
-        best_val_score = -1.0
-        patience_counter = 0
         patience = getattr(self.config.train, 'patience', 15)
+        contrastive_warmup = getattr(self.config.train, 'contrastive_warmup_epoch', 20)
+
+        # --- Decision 2 & 3: MA5 scoring + local-peak top-3 checkpoints ---
+        score_history = []  # raw S_t per epoch
+        top_k = 3
+        min_peak_gap = 4  # min epochs between saved peaks
+        # Each entry: (ma5_score, epoch, ckpt_path) - only local peaks
+        peak_ckpts = []
+        best_stage2_ma5 = -1.0
+        # Decision 4: stage3 gate
+        stage3_consecutive_better = 0
+        stage3_allowed = False
+
+        patience_counter = 0
+        best_patience_score = -1.0
 
         for epoch in range(max_epochs):
             self.config.train.epoch = epoch
-            # print(f'#IN#Epoch {epoch}:')
-
             mean_loss = 0
             spec_loss = 0
 
             self.ood_algorithm.stage_control(self.config)
 
-            # pbar = tqdm(enumerate(self.loader['train']), total=len(self.loader['train']), **pbar_setting)
-            # for index, data in pbar:
             for index, data in enumerate(self.loader['train']):
                 if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
                     continue
-
-                # Parameter for DANN
                 p = (index / len(self.loader['train']) + epoch) / max_epochs
                 self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
-                # train a batch
-                # train_stat = self.train_batch(data, pbar)
                 train_stat = self.train_batch(data, None)
                 mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
 
                 if self.ood_algorithm.spec_loss is not None:
                     if isinstance(self.ood_algorithm.spec_loss, dict):
-                        desc = f'ML: {mean_loss:.4f}|'
+                        if not isinstance(spec_loss, dict):
+                            spec_loss = dict()
                         for loss_name, loss_value in self.ood_algorithm.spec_loss.items():
-                            if not isinstance(spec_loss, dict):
-                                spec_loss = dict()
-                            if loss_name not in spec_loss.keys():
+                            if loss_name not in spec_loss:
                                 spec_loss[loss_name] = 0
                             spec_loss[loss_name] = (spec_loss[loss_name] * index + loss_value) / (index + 1)
-                            desc += f'{loss_name}: {spec_loss[loss_name]:.4f}|'
-                        # pbar.set_description(desc[:-1])
-                    else:
-                        spec_loss = (spec_loss * index + self.ood_algorithm.spec_loss) / (index + 1)
-                        # pbar.set_description(f'M/S Loss: {mean_loss:.4f}/{spec_loss:.4f}')
-                # else:
-                #     pbar.set_description(f'Loss: {mean_loss:.4f}')
 
-            # Eval training score
+            # Print training loss
+            if self.ood_algorithm.spec_loss is not None and isinstance(spec_loss, dict):
+                desc = f'ML: {mean_loss:.4f}|'
+                for ln, lv in spec_loss.items():
+                    desc += f'{ln}: {lv:.4f}|'
+                print(f'#IN#Epoch {epoch}: {desc[:-1]}')
 
-            # Epoch val
-            # print('#IN#\nEvaluating...')
-            if self.ood_algorithm.spec_loss is not None:
-                if isinstance(self.ood_algorithm.spec_loss, dict):
-                    desc = f'ML: {mean_loss:.4f}|'
-                    for loss_name, loss_value in self.ood_algorithm.spec_loss.items():
-                        desc += f'{loss_name}: {spec_loss[loss_name]:.4f}|'
-                    print(f'#IN#Epoch {epoch}: Approximated ' + desc[:-1])
-                else:
-                    print(f'#IN#Epoch {epoch}: Approximated average M/S Loss {mean_loss:.4f}/{spec_loss:.4f}')
-            # else:
-                # print(f'#IN#Epoch {epoch}: Approximated average training loss {mean_loss.cpu().item():.4f}')
-
+            # Evaluate
             epoch_train_stat = self.evaluate('eval_train')
-            id_val_stat = self.evaluate('id_val')
+            id_val_stat = self.evaluate('id_val', True)
             id_test_stat = self.evaluate('id_test', True)
-            val_stat = self.evaluate('val')
+            val_stat = self.evaluate('val', True)
             test_stat = self.evaluate('test', True)
-            print(f'#IN#Epoch {epoch}: Train acc {epoch_train_stat["score"]:.4f}, '
-                  f'ID_val acc {id_val_stat["score"]:.4f}, '
-                  f'ID_test acc {id_test_stat["score"]:.4f},'
-                  f'OOD_val acc {val_stat["score"]:.4f}, '
-                  f'OOD_test acc {test_stat["score"]:.4f}')
-            # print(f'#IN#Epoch {epoch}: Test precision {test_stat["precision"]:.4f}, '
-            #       f'recall {test_stat["recall"]:.4f}, f1 {test_stat["f1"]:.4f}, roc_auc {test_stat["roc_auc"]:.4f}\n')
+            print(f'#IN#Epoch {epoch}: Train {epoch_train_stat["score"]:.4f}, '
+                  f'ID_val {id_val_stat["score"]:.4f}(BA={id_val_stat.get("balanced_accuracy", 0):.4f}), '
+                  f'ID_test {id_test_stat["score"]:.4f}, '
+                  f'OOD_val {val_stat["score"]:.4f}(BA={val_stat.get("balanced_accuracy", 0):.4f}, AUC={val_stat.get("roc_auc", 0):.4f}), '
+                  f'OOD_test {test_stat["score"]:.4f}(BA={test_stat.get("balanced_accuracy", 0):.4f})')
 
-            # checkpoints save
-            self.save_epoch(epoch, epoch_train_stat, id_val_stat, id_test_stat, val_stat, test_stat, self.config, fold)
+            # --- Decision 2: S_t = 0.6*BA_OOD + 0.2*AUROC_OOD + 0.2*BA_ID ---
+            ba_ood = val_stat.get('balanced_accuracy', val_stat['score']) or 0.0
+            auroc_ood = val_stat.get('roc_auc', val_stat['score']) or 0.0
+            ba_id = id_val_stat.get('balanced_accuracy', id_val_stat['score']) or 0.0
+            s_t = 0.6 * ba_ood + 0.2 * auroc_ood + 0.2 * ba_id
+            score_history.append(s_t)
 
-            # --- early stopping ---
-            combined_val = (val_stat['score'] + id_val_stat['score']) / 2 if id_val_stat.get('score') else val_stat['score']
-            if combined_val > best_val_score:
-                best_val_score = combined_val
+            # MA5: average of last 5 S_t values
+            window = score_history[-5:]
+            ma5 = sum(window) / len(window)
+
+            # --- Save checkpoint (always save for top-k tracking) ---
+            ckpt = self._build_ckpt(epoch, epoch_train_stat, id_val_stat, id_test_stat, val_stat, test_stat)
+            if not os.path.exists(self.config.ckpt_dir):
+                os.makedirs(self.config.ckpt_dir)
+            ckpt_path = os.path.join(self.config.ckpt_dir, f'{epoch}.ckpt')
+            torch.save(ckpt, ckpt_path)
+            shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
+
+            # --- Decision 1 & 4: Stage-aware checkpoint selection ---
+            in_stage3 = epoch >= contrastive_warmup
+            is_candidate = epoch >= 3  # skip first 3 epochs
+
+            if is_candidate and not in_stage3:
+                # Stage 2: always eligible for main results
+                if ma5 > best_stage2_ma5:
+                    best_stage2_ma5 = ma5
+
+                # Local peak detection: S_t higher than previous
+                is_local_peak = len(score_history) >= 2 and s_t >= score_history[-2]
+                if len(score_history) >= 3:
+                    is_local_peak = is_local_peak and s_t >= score_history[-3]
+
+                # Min gap: at least 4 epochs from last saved peak
+                last_peak_epoch = peak_ckpts[-1][1] if peak_ckpts else -999
+                has_min_gap = (epoch - last_peak_epoch) >= min_peak_gap
+
+                if is_local_peak and has_min_gap:
+                    peak_ckpts.append((ma5, epoch, ckpt_path))
+                    peak_ckpts.sort(key=lambda x: x[0], reverse=True)
+                    while len(peak_ckpts) > top_k:
+                        _, _, old_path = peak_ckpts.pop()
+                        if os.path.exists(old_path) and not old_path.endswith(f'last{fold}.ckpt'):
+                            try:
+                                os.unlink(old_path)
+                            except OSError:
+                                pass
+                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (stage2, LOCAL PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
+                else:
+                    if os.path.exists(ckpt_path) and not ckpt_path.endswith(f'last{fold}.ckpt'):
+                        try:
+                            os.unlink(ckpt_path)
+                        except OSError:
+                            pass
+                    reason = 'not peak' if not is_local_peak else f'gap={epoch - last_peak_epoch}<{min_peak_gap}'
+                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (stage2, {reason})')
+
+            elif is_candidate and in_stage3:
+                # Decision 4: stage3 only enters if MA5 > best_stage2 + 0.02 for 3 consecutive epochs
+                if ma5 > best_stage2_ma5 + 0.02:
+                    stage3_consecutive_better += 1
+                else:
+                    stage3_consecutive_better = 0
+
+                if stage3_consecutive_better >= 3:
+                    stage3_allowed = True
+
+                if stage3_allowed:
+                    is_local_peak = len(score_history) >= 2 and s_t >= score_history[-2]
+                    last_peak_epoch = peak_ckpts[-1][1] if peak_ckpts else -999
+                    has_min_gap = (epoch - last_peak_epoch) >= min_peak_gap
+
+                    if is_local_peak and has_min_gap:
+                        peak_ckpts.append((ma5, epoch, ckpt_path))
+                        peak_ckpts.sort(key=lambda x: x[0], reverse=True)
+                        while len(peak_ckpts) > top_k:
+                            _, _, old_path = peak_ckpts.pop()
+                            if os.path.exists(old_path):
+                                try:
+                                    os.unlink(old_path)
+                                except OSError:
+                                    pass
+                        print(f'#IN#  MA5={ma5:.4f} (stage3 ALLOWED, PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
+                    else:
+                        if os.path.exists(ckpt_path):
+                            try:
+                                os.unlink(ckpt_path)
+                            except OSError:
+                                pass
+                        print(f'#IN#  MA5={ma5:.4f} (stage3 ALLOWED, not peak)')
+                else:
+                    print(f'#IN#  MA5={ma5:.4f} (stage3, not yet qualified, streak={stage3_consecutive_better}/3)')
+                    if os.path.exists(ckpt_path):
+                        try:
+                            os.unlink(ckpt_path)
+                        except OSError:
+                            pass
+
+            # --- Early stopping on MA3 ---
+            if ma5 > best_patience_score:
+                best_patience_score = ma5
                 patience_counter = 0
             else:
                 patience_counter += 1
             if patience_counter >= patience:
-                print(f'#IN# Early stopping at epoch {epoch} (best val: {best_val_score:.4f})')
+                print(f'#IN# Early stopping at epoch {epoch} (best MA3: {best_patience_score:.4f})')
                 break
 
-            # --- scheduler step ---
             self.ood_algorithm.scheduler.step()
 
-        # print('#IN#Training end.')
+        # --- Save top-k info for test-time ensemble ---
+        topk_info_path = os.path.join(self.config.ckpt_dir, f'topk{fold}.info')
+        topk_paths = [p for _, _, p in peak_ckpts if os.path.exists(p)]
+        with open(topk_info_path, 'w') as f:
+            for p in topk_paths:
+                f.write(p + '\n')
+        print(f'#IN# Saved top-{len(topk_paths)} peak checkpoints for ensemble.')
+
+        # --- Save best{fold}.ckpt and id_best{fold}.ckpt for backward compat ---
+        if peak_ckpts:
+            best_path = peak_ckpts[0][2]  # highest MA5
+            shutil.copy(best_path, os.path.join(self.config.ckpt_dir, f"best{fold}.ckpt"))
+            shutil.copy(best_path, os.path.join(self.config.ckpt_dir, f"id_best{fold}.ckpt"))
+            print(f"#IN# Best checkpoint: epoch {peak_ckpts[0][1]} (MA5={peak_ckpts[0][0]:.4f})")
 
     @torch.no_grad()
     def evaluate(self, split: str, full_metrics: bool = True) -> Dict[str, float]:
@@ -418,11 +510,13 @@ class Pipeline:
             stat['recall'] = eval_score(pred_all, target_all, self.config.metric.recall)
             stat['f1'] = eval_score(pred_all, target_all, self.config.metric.f1)
             stat['roc_auc'] = eval_score(pred_all, target_all, self.config.metric.roc_auc_score)
+            stat['balanced_accuracy'] = eval_score(pred_all, target_all, self.config.metric.balanced_accuracy)
         else:
             stat['precision'] = stat['score']
             stat['recall'] = stat['score']
             stat['f1'] = stat['score']
             stat['roc_auc'] = stat['score']
+            stat['balanced_accuracy'] = stat['score']
 
         # print(f'#IN#\n{split.capitalize()} {self.config.metric.score_name}: {stat["score"]:.4f}\n'
         #       f'{split.capitalize()} Loss: {stat["loss"]:.4f}')
@@ -431,7 +525,7 @@ class Pipeline:
 
         return {'score': stat['score'], 'loss': stat['loss'], 'precision': stat['precision'],
                 'recall': stat['recall'], 'f1': stat['f1'], 'roc_auc': stat['roc_auc'],
-                'subject_num': mask_all.sum()}
+                'balanced_accuracy': stat['balanced_accuracy'], 'subject_num': mask_all.sum()}
 
     def load_task(self, fold=0):
         r"""
@@ -441,11 +535,127 @@ class Pipeline:
             self.train(fold)
 
         elif self.task == 'test':
+            # Decision 3: ensemble top-k checkpoints
+            topk_info_path = os.path.join(self.config.ckpt_dir, f'topk{fold}.info')
+            if os.path.exists(topk_info_path):
+                with open(topk_info_path) as f:
+                    ckpt_paths = [l.strip() for l in f if l.strip() and os.path.exists(l.strip())]
+                if ckpt_paths:
+                    print(f'#IN# Ensemble evaluation with {len(ckpt_paths)} checkpoints')
+                    ensemble_ckpt = self._ensemble_evaluate(ckpt_paths, fold)
+                    # Also load single best for backward compat
+                    best_ckpt_path = ckpt_paths[0]  # highest MA3
+                    single_ckpt = torch.load(best_ckpt_path, map_location=self.config.device)
+                    return ensemble_ckpt, single_ckpt
 
-            # config model
+            # Fallback to old behavior
             print('#D#Config model and output the best checkpoint info...')
             in_ckpt, ckpt = self.config_model('test', fold)
             return in_ckpt, ckpt
+
+    @torch.no_grad()
+    def _ensemble_evaluate(self, ckpt_paths, fold):
+        """Ensemble top-k checkpoints: average softmax probabilities, then predict."""
+        from GOOD.utils.evaluation import eval_data_preprocess, eval_score
+
+        all_probs = {}  # split -> list of prob arrays per checkpoint
+        targets_cache = {}
+        masks_cache = {}
+
+        for ci, cp in enumerate(ckpt_paths):
+            ckpt = torch.load(cp, map_location=self.config.device)
+            self.model.load_state_dict(ckpt['state_dict'])
+            self.model.eval()
+            print(f'  Checkpoint {ci}: epoch {ckpt["epoch"]}')
+
+            for split in ['eval_train', 'id_val', 'id_test', 'val', 'test']:
+                if self.loader.get(split) is None:
+                    continue
+                preds_this = []
+                targets_this = []
+                for data in self.loader[split]:
+                    data = data.to(self.config.device)
+                    mask, targets = nan2zero_get_mask(data, split, self.config)
+                    if mask is None:
+                        continue
+                    data, targets, mask, _ = self.ood_algorithm.input_preprocess(
+                        data, targets, mask, None, False, self.config)
+                    out = self.model(data=data, edge_weight=None, ood_algorithm=self.ood_algorithm)
+                    raw = self.ood_algorithm.output_postprocess(out)
+                    # Get softmax probs
+                    probs = torch.softmax(raw, dim=1).cpu()
+                    preds_this.append(probs)
+                    if ci == 0:
+                        if split not in targets_cache:
+                            targets_cache[split] = []
+                        targets_cache[split].append(data.y.cpu())
+
+                if split not in all_probs:
+                    all_probs[split] = []
+                all_probs[split].append(torch.cat(preds_this, dim=0))
+
+        # Average probs across checkpoints
+        avg_probs_dict = {}
+        targets_dict = {}
+        for split in all_probs:
+            avg_probs_dict[split] = torch.stack(all_probs[split]).mean(dim=0)  # [N, C]
+            targets_dict[split] = torch.cat(targets_cache.get(split, []), dim=0).squeeze()
+
+        # --- Threshold tuning on OOD val: maximize balanced accuracy ---
+        best_threshold = 0.5
+        if 'val' in avg_probs_dict:
+            from sklearn.metrics import balanced_accuracy_score as ba_score
+            val_p1 = avg_probs_dict['val'][:, 1]
+            val_tgt = targets_dict['val']
+            best_ba = -1.0
+            for thr in [i * 0.05 for i in range(1, 20)]:
+                preds_thr = (val_p1 >= thr).long()
+                ba = ba_score(val_tgt.numpy(), preds_thr.numpy())
+                if ba > best_ba:
+                    best_ba = ba
+                    best_threshold = thr
+            print(f'  Threshold tuned on OOD_val: {best_threshold:.2f} (BA={best_ba:.4f})')
+
+        # Compute metrics with tuned threshold
+        result_ckpt = {}
+        for split in avg_probs_dict:
+            avg_probs = avg_probs_dict[split]
+            targets = targets_dict[split]
+            prob_class1 = avg_probs[:, 1]
+            preds = (prob_class1 >= best_threshold).long()
+            acc = (preds == targets).float().mean().item()
+            from sklearn.metrics import balanced_accuracy_score as ba_score
+            from sklearn.metrics import roc_auc_score as sk_auroc
+            ba = ba_score(targets.numpy(), preds.numpy())
+            try:
+                auroc = sk_auroc(targets.numpy(), prob_class1.numpy())
+            except ValueError:
+                auroc = 0.5
+
+            prefix = {'eval_train': 'train', 'id_val': 'id_val', 'id_test': 'id_test',
+                       'val': 'ood_val', 'test': 'ood_test'}.get(split, split)
+            result_ckpt[f'{prefix}_score'] = acc
+            result_ckpt[f'{prefix}_balanced_accuracy'] = ba
+            result_ckpt[f'{prefix}_roc_auc'] = auroc
+            print(f'  Ensemble {split}: acc={acc:.4f}, BA={ba:.4f}, AUROC={auroc:.4f} (thr={best_threshold:.2f})')
+
+        # Fill in required fields for backward compat
+        result_ckpt['epoch'] = 'ensemble'
+        result_ckpt['train_score'] = result_ckpt.get('train_score', 0)
+        result_ckpt['train_loss'] = torch.tensor(0.0)
+        for key in ['id_val_loss', 'id_test_loss', 'ood_val_loss', 'ood_test_loss']:
+            result_ckpt[key] = torch.tensor(0.0)
+        result_ckpt['val_score'] = result_ckpt.get('ood_val_score', 0)
+        result_ckpt['test_score'] = result_ckpt.get('ood_test_score', 0)
+        for suffix in ['precision', 'recall', 'f1', 'roc_auc']:
+            result_ckpt[f'id_test_{suffix}'] = result_ckpt.get('id_test_score', 0)
+            result_ckpt[f'ood_test_{suffix}'] = result_ckpt.get('ood_test_score', 0)
+        result_ckpt['id_val_subject_num'] = 1
+        result_ckpt['id_test_subject_num'] = 1
+        result_ckpt['ood_val_subject_num'] = 1
+        result_ckpt['ood_test_subject_num'] = 1
+
+        return result_ckpt
 
     def config_model(self, mode: str, load_param=False, fold=0):
         r"""
@@ -533,6 +743,45 @@ class Pipeline:
                 self.model.load_state_dict(ckpt['state_dict'])
             return id_ckpt, ckpt
 
+    def _build_ckpt(self, epoch, train_stat, id_val_stat, id_test_stat, val_stat, test_stat):
+        """Build checkpoint dict without saving."""
+        config = self.config
+        return {
+            'state_dict': self.model.state_dict(),
+            'train_score': train_stat['score'],
+            'train_loss': train_stat['loss'],
+            'id_val_score': id_val_stat['score'],
+            'id_val_loss': id_val_stat['loss'],
+            'id_test_score': id_test_stat['score'],
+            'id_test_loss': id_test_stat['loss'],
+            'id_test_precision': id_test_stat['precision'],
+            'id_test_recall': id_test_stat['recall'],
+            'id_test_f1': id_test_stat['f1'],
+            'id_test_roc_auc': id_test_stat['roc_auc'],
+            'ood_val_score': val_stat['score'],
+            'ood_val_loss': val_stat['loss'],
+            'ood_test_score': test_stat['score'],
+            'ood_test_loss': test_stat['loss'],
+            'ood_test_precision': test_stat['precision'],
+            'ood_test_recall': test_stat['recall'],
+            'ood_test_f1': test_stat['f1'],
+            'ood_test_roc_auc': test_stat['roc_auc'],
+            'ood_val_balanced_accuracy': val_stat.get('balanced_accuracy', val_stat['score']),
+            'ood_test_balanced_accuracy': test_stat.get('balanced_accuracy', test_stat['score']),
+            'id_val_balanced_accuracy': id_val_stat.get('balanced_accuracy', id_val_stat['score']),
+            'id_test_balanced_accuracy': id_test_stat.get('balanced_accuracy', id_test_stat['score']),
+            'val_score': val_stat['score'],
+            'val_loss': val_stat['loss'],
+            'test_score': test_stat['score'],
+            'test_loss': test_stat['loss'],
+            'id_val_subject_num': id_val_stat['subject_num'],
+            'id_test_subject_num': id_test_stat['subject_num'],
+            'ood_val_subject_num': val_stat['subject_num'],
+            'ood_test_subject_num': test_stat['subject_num'],
+            'epoch': epoch,
+            'max epoch': config.train.max_epoch
+        }
+
     def save_epoch(self, epoch: int, train_stat: dir, id_val_stat: dir, id_test_stat: dir, val_stat: dir,
                    test_stat: dir, config: Union[CommonArgs, Munch], fold=0):
         r"""
@@ -573,8 +822,14 @@ class Pipeline:
             'ood_test_recall': test_stat['recall'],
             'ood_test_f1': test_stat['f1'],
             'ood_test_roc_auc': test_stat['roc_auc'],
+            'ood_val_balanced_accuracy': val_stat.get('balanced_accuracy', val_stat['score']),
+            'ood_test_balanced_accuracy': test_stat.get('balanced_accuracy', test_stat['score']),
+            'id_val_balanced_accuracy': id_val_stat.get('balanced_accuracy', id_val_stat['score']),
+            'id_test_balanced_accuracy': id_test_stat.get('balanced_accuracy', id_test_stat['score']),
             'val_score': val_stat['score'],
+            'val_loss': val_stat['loss'],
             'test_score': test_stat['score'],
+            'test_loss': test_stat['loss'],
             'mixed_val_score': (val_stat['score'] * val_stat['subject_num'] + id_val_stat['score'] * id_val_stat['subject_num']) / (
                     val_stat['subject_num'] + id_val_stat['subject_num']),
             'mixed_test_score': (test_stat['score'] * test_stat['subject_num'] + id_test_stat['score'] * id_test_stat['subject_num']) / (

@@ -292,6 +292,9 @@ def process_configs(config: Union[CommonArgs, Munch], fold: int):
 
     # --- Attach train_helper and metric modules ---
     config.metric = Metric()
+    ls = getattr(config.train, 'label_smoothing', 0.0)
+    if ls > 0:
+        config.metric.set_label_smoothing(ls)
 
 
 def config_summoner(args: CommonArgs) -> Union[CommonArgs, Munch]:

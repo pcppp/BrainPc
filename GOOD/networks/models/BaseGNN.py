@@ -124,9 +124,10 @@ class BasicEncoder(torch.nn.Module):
                 for _ in range(num_layer - 1)
             ]
         else:
-            self.batch_norm1 = nn.BatchNorm1d(config.model.dim_hidden)
+            # LayerNorm instead of BatchNorm: more stable for small-batch multi-site
+            self.batch_norm1 = nn.LayerNorm(config.model.dim_hidden)
             self.batch_norms = nn.ModuleList([
-                nn.BatchNorm1d(config.model.dim_hidden)
+                nn.LayerNorm(config.model.dim_hidden)
                 for _ in range(num_layer - 1)
             ])
         self.dropout1 = nn.Dropout(config.model.dropout_rate)

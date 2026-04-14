@@ -23,7 +23,6 @@ model:
   lstm_hidden_size: 128
   dim_hidden: 64
   dim_ffn: 64
-  num_layer: 2
   dropout_rate: 0.3
   use_cnn: False
 dataset:

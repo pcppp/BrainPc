@@ -332,7 +332,7 @@ class Pipeline:
         # print('#IN#Training end.')
 
     @torch.no_grad()
-    def evaluate(self, split: str, full_metrics: bool = False) -> Dict[str, float]:
+    def evaluate(self, split: str, full_metrics: bool = True) -> Dict[str, float]:
         r"""
         This function is design to collect data results and calculate scores and loss given a dataset subset.
         (For project use only)
@@ -393,7 +393,7 @@ class Pipeline:
         stat['score'] = eval_score(pred_all, target_all, self.config.metric.score_func)
 
         # ----------calculation of more metrics----------------
-        if self.config.metric.dataset_task == 'Binary classification' and full_metrics:
+        if full_metrics:
             stat['precision'] = eval_score(pred_all, target_all, self.config.metric.precision)
             stat['recall'] = eval_score(pred_all, target_all, self.config.metric.recall)
             stat['f1'] = eval_score(pred_all, target_all, self.config.metric.f1)

@@ -34,6 +34,7 @@ class Metric(object):
         self.loss_func = self.cross_entropy_with_logit
         self.score_func = self.roc_auc_score
         self.dataset_task = ''
+        self._label_smoothing = 0.0
         self.score_name = ''
 
         self.lower_better = -1
@@ -55,6 +56,9 @@ class Metric(object):
         self.dataset_task = task_name
         self.loss_func = self.task2loss.get(task_name)
         assert self.loss_func is not None
+
+    def set_label_smoothing(self, ls):
+        self._label_smoothing = ls
 
     def set_score_func(self, metric_name):
         r"""
@@ -93,7 +97,7 @@ class Metric(object):
             pred_label = pred_label.round()
             return f1_score(true, pred_label, zero_division=0)
         else:
-            torch.argmax(pred_label, dim=1)
+            pred_label = torch.argmax(pred_label, dim=1)
             return f1_score(true, pred_label, average='micro', zero_division=0)
 
     def ap(self, y_true, y_pred):
@@ -128,8 +132,12 @@ class Metric(object):
             pred_label = pred_label.round()
             return sk_roc_auc(true, pred_label)
         else:
-            torch.argmax(pred_label, dim=1)
-            return sk_roc_auc(true, pred_label, average='ovo')
+            # For multi-class AUC, use softmax probabilities directly
+            try:
+                return sk_roc_auc(true, pred_label, multi_class='ovo')
+            except ValueError:
+                # Fallback if only one class in batch
+                return 0.5
 
     def reg_absolute_error(self, y_true, y_pred):
         r"""
@@ -181,7 +189,7 @@ class Metric(object):
             pred_label = pred_label.round()
             return precision_score(true, pred_label, zero_division=0)
         else:
-            torch.argmax(pred_label, dim=1)
+            pred_label = torch.argmax(pred_label, dim=1)
             return precision_score(true, pred_label, average='micro', zero_division=0)
 
     def recall(self, y_true, y_pred):
@@ -202,7 +210,7 @@ class Metric(object):
             pred_label = pred_label.round()
             return recall_score(true, pred_label, zero_division=0)
         else:
-            torch.argmax(pred_label, dim=1)
+            pred_label = torch.argmax(pred_label, dim=1)
             return recall_score(true, pred_label, average='micro', zero_division=0)
 
     def rmse(self, y_true, y_pred):
@@ -221,7 +229,7 @@ class Metric(object):
 
     def cross_entropy_with_logit(self, y_pred: torch.Tensor, y_true: torch.Tensor, **kwargs):
         r"""
-        Calculate cross entropy loss
+        Calculate cross entropy loss with optional label smoothing.
 
         Args:
             y_pred (torch.tensor): label predictions
@@ -232,5 +240,6 @@ class Metric(object):
             cross entropy loss
 
         """
-        return cross_entropy(y_pred, y_true.long(), **kwargs)
+        ls = kwargs.pop('label_smoothing', self._label_smoothing)
+        return cross_entropy(y_pred, y_true.long(), label_smoothing=ls, **kwargs)
 

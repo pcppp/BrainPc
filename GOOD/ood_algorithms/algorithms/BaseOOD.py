@@ -47,16 +47,16 @@ class BaseOODAlg(ABC):
         
         # 2. 确定当前阶段的学习率
         # 通常微调阶段(finetune)的学习率比预训练要小，或者在 config 里区分配置
-        lr = config.train.pre_lr
-        t_epochs = config.train.pre_epoch
-        if mode == 'finetune' and hasattr(config.train, 'lr'):
+        lr = getattr(config.train, 'pre_lr', config.train.lr)
+        t_epochs = getattr(config.train, 'pre_epoch', config.train.max_epoch)
+        if mode == 'finetune':
             lr = config.train.lr
             t_epochs = config.train.max_epoch
         
         # 3. 【关键】重置优化器
         # 因为参数变了 (ProjectionHead vs ClassifierHead)，必须重新注册 parameters
         # filter(lambda p: p.requires_grad, ...) 确保只优化没被冻结的层
-        self.optimizer = torch.optim.Adam(
+        self.optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
             lr=lr,
             weight_decay=config.train.weight_decay
@@ -287,10 +287,10 @@ class BaseOODAlg(ABC):
 
     def set_up(self, model: torch.nn.Module, config: Union[CommonArgs, Munch]):
         self.model: torch.nn.Module = model
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.train.lr,
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.train.lr,
                                           weight_decay=config.train.weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=config.train.mile_stones,
-                                                              gamma=0.1)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=config.train.max_epoch, eta_min=1e-6)
 
     def backward(self, loss):
         loss.backward()

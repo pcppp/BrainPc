@@ -59,10 +59,14 @@ If you have any questions, please feel free to reach out at `jiaxing003@e.ntu.ed
 - Soft edge construction: Ledoit-Wolf shrinkage covariance + |w|>0.05 threshold replaces the old top-20% hard threshold, retaining ~74% of edges.
 - Preprocessing: edge_ratio changed from 0.2 to 1.0 (complete graph) in both dataPreprocessing.py and dataPreprocessing_sliding.py.
 
-### Contrastive Learning Improvements
-- Asymmetric VICReg: Replaced InfoNCE with VICReg using stop-gradient on the original (teacher) branch; only the granular-ball (student) branch receives variance/covariance regularization.
-- Shared calibration: SiteCalibration parameters are estimated once from the original graph and applied to both original and granular-ball views via apply_params().
-- Gate-cons removal: Gate consistency loss was removed (it penalized scale difference rather than site difference).
+### Granular-Ball Cross-Reweight (GBCR)
+- Replaced VICReg contrastive branch with GBCR module embedded inside the GNN.
+- GBCR sits between GAT layer 1 and layer 2: forms K=14 soft granular balls from mid-level representations, estimates ball-level node/edge importance, and maps importance back to the original graph as residual reweighting.
+- Layer 2 changed from GATConv to GATv2Conv(edge_dim=1) to accept edge importance from GBCR.
+- Node reweight: h+ = h * (1 + alpha_n * u), where u = Qr (ball importance mapped to nodes).
+- Edge reweight: attention bias from ball-ball importance S mapped via M = QSQ^T.
+- Domain generalization: class-conditional ball importance alignment across sites (L_gb-dg).
+- Assignment entropy loss encourages balanced ball membership.
 
 ### Training Strategy (4 Strategic Decisions)
 1. Stage-2-only main results: Stage 1+2 (classifier + site calibration) produce main results; stage 3 (GB/VICReg contrastive) is ablation-only.

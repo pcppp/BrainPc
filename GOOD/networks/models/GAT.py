@@ -12,6 +12,7 @@ from GOOD import register
 from GOOD.utils.config_reader import Union, CommonArgs, Munch
 from .BaseGNN import GNNBasic, BasicEncoder
 from .Classifiers import Classifier
+from .gbcr import GBCR
 
 
 @register.model_register
@@ -143,38 +144,63 @@ class GATEncoder(BasicEncoder):
     def __init__(self, config: Union[CommonArgs, Munch]):
         super(GATEncoder, self).__init__(config)
         num_layer = config.model.model_layer
-        heads = 1 #config.model.attention_heads
+        heads = 1
 
+        # Layer 1: standard GATConv
         self.conv1 = gnn.GATConv(config.dataset.dim_node, config.model.dim_hidden, heads=heads)
+
+        # GBCR: inserted between layer 1 and layer 2
+        num_balls = getattr(config.model, 'num_balls', 14)
+        alpha_node = getattr(config.model, 'gbcr_alpha_node', 0.15)
+        alpha_edge = getattr(config.model, 'gbcr_alpha_edge', 0.25)
+        self.gbcr = GBCR(
+            feat_dim=config.model.dim_hidden,
+            num_balls=num_balls,
+            alpha_node=alpha_node,
+            alpha_edge=alpha_edge,
+        )
+
+        # Layer 2+: GATv2Conv with edge_dim=1 to accept edge importance from GBCR
         self.convs = nn.ModuleList(
             [
-                gnn.GATConv(config.model.dim_hidden * heads, config.model.dim_hidden, heads=heads)
+                gnn.GATv2Conv(config.model.dim_hidden * heads, config.model.dim_hidden,
+                              heads=heads, edge_dim=1)
                 for _ in range(num_layer - 1)
             ]
         )
-        # 训练对比学习的loss
         self.projection_head = nn.Sequential(
-            nn.Linear(config.model.dim_hidden,config.model.dim_hidden),
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden),
             nn.ReLU(),
-            nn.Linear(config.model.dim_hidden,config.model.dim_hidden)
+            nn.Linear(config.model.dim_hidden, config.model.dim_hidden)
         )
 
-    def forward(self, x, edge_index,edge_weight, batch, batch_size, **kwargs):
+    def forward(self, x, edge_index, edge_weight, batch, batch_size, **kwargs):
         r"""
-        The GAT encoder.
+        The GAT encoder with GBCR between layer 1 and layer 2.
 
-        Args:
-            x (Tensor): node features
-            edge_index (Tensor): edge indices
-            batch (Tensor): batch indicator
+        After layer 1, the GBCR module:
+          - forms soft granular balls from mid-level representations
+          - estimates node and edge importance
+          - reweights nodes and produces edge attention bias
 
-        Returns (Tensor):
-            node feature representations
+        Layer 2+ uses GATv2Conv with the edge importance as edge_attr.
         """
-        post_conv = self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index,edge_weight))))
+        # Layer 1: standard GAT
+        post_conv = self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index, edge_weight))))
+
+        # GBCR: granular-ball cross-reweight
+        if batch is None:
+            batch = torch.zeros(post_conv.size(0), dtype=torch.long, device=post_conv.device)
+        post_conv, edge_importance, gbcr_info = self.gbcr(post_conv, edge_index, batch)
+        # Store GBCR info for loss computation (accessible from model)
+        self._gbcr_info = gbcr_info
+        self._gbcr_edge_importance = edge_importance
+
+        # Layer 2+: GATv2Conv with edge importance as edge_attr
+        edge_attr = (1.0 + self.gbcr.alpha_edge * edge_importance).unsqueeze(-1)  # [E, 1]
         for i, (conv, batch_norm, relu, dropout) in enumerate(
                 zip(self.convs, self.batch_norms, self.relus, self.dropouts)):
-            post_conv = batch_norm(conv(post_conv, edge_index,edge_weight))
+            post_conv = batch_norm(conv(post_conv, edge_index, edge_attr=edge_attr))
             if i < len(self.convs) - 1:
                 post_conv = relu(post_conv)
             post_conv = dropout(post_conv)
@@ -183,7 +209,7 @@ class GATEncoder(BasicEncoder):
             return post_conv
         out_readout = self.readout(post_conv, batch, batch_size)
         z = self.projection_head(out_readout)
-        return out_readout,z
+        return out_readout, z
 
 
 class GATConv(gnn.GATConv):

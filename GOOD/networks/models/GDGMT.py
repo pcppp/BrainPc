@@ -283,6 +283,13 @@ class GDGMT(GNNBasic):
         logits = torch.stack(sampling_logits).mean(dim=0)
         return logits, None, None
 
+    def get_gbcr_info(self):
+        """Access GBCR info from the last forward pass (stored in GNN encoder)."""
+        encoder = self.gnn.encoder if hasattr(self.gnn, 'encoder') else None
+        if encoder is not None and hasattr(encoder, '_gbcr_info'):
+            return encoder._gbcr_info
+        return None
+
     def sampling(self, att_log_logits, training):
         if self.sampling_method =="normal":
             att = self.normal_sample(att_log_logits, temp=1.0, training=training)

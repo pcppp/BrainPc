@@ -45,151 +45,25 @@ class Pipeline:
         self.ood_algorithm: BaseOODAlg = ood_algorithm
         self.config: Union[CommonArgs, Munch] = config
 
-    @staticmethod
-    def _vicreg_loss(z_teacher, z_student, sim_weight=1.0, var_weight=1.0, cov_weight=0.02):
-        """Asymmetric VICReg: granular-ball distills from original graph.
 
-        - Invariance: MSE(sg(z_teacher), z_student)  — teacher is stop-grad
-        - Variance/Covariance: only on z_student (prevent collapse of student)
-        """
-        # Invariance: student matches stop-grad teacher
-        inv_loss = torch.nn.functional.mse_loss(z_student, z_teacher.detach())
-
-        # Variance: only on student branch (teacher is frozen, no collapse risk)
-        def var_term(z):
-            std = z.std(dim=0)
-            return torch.relu(1.0 - std).mean()
-        var_loss = var_term(z_student)
-
-        # Covariance: only on student branch
-        def cov_term(z):
-            n = z.size(0)
-            z_centered = z - z.mean(dim=0)
-            cov = (z_centered.T @ z_centered) / max(n - 1, 1)
-            off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
-            return off_diag / z.size(1)
-        cov_loss = cov_term(z_student)
-
-        return sim_weight * inv_loss + var_weight * var_loss + cov_weight * cov_loss
-
-    def _compute_contrastive_reg(self, data: Batch) -> dict:
-        """Cross-scale contrastive regularization using VICReg-style loss.
-
-        Calibration params (gamma, beta, gate) are estimated ONCE from the original
-        graph and shared to the granular-ball view, avoiding scale-mismatch artifacts.
-
-        Returns dict with gb_loss, site_adv_loss.
-        """
-        from GOOD.data.gb import build_granular_ball_view
-
-        graph_list = data.to_data_list()
-        ball_r = getattr(self.config.train, 'ball_r', 0.5)
-
-        coarse_graphs = [build_granular_ball_view(g, ball_r=ball_r) for g in graph_list]
-        view_gb = Batch.from_data_list(coarse_graphs).to(self.config.device)
-        view_orig = Batch.from_data_list([g.clone() for g in graph_list]).to(self.config.device)
-
-        # Estimate calibration params from original graph only
-        emb_orig, calib_info = self._extract_graph_embedding(view_orig, return_calib_info=True)
-        # Apply the SAME params to granular-ball view
-        emb_gb = self._extract_graph_embedding_shared_calib(view_gb, calib_info)
-
-        proj_orig = self.model.proj_head(emb_orig)
-        proj_gb = self.model.proj_head(emb_gb)
-
-        # VICReg instead of InfoNCE
-        var_w = getattr(self.config.ood, 'variance_weight', 0.5)
-        cov_w = getattr(self.config.ood, 'covariance_weight', 0.02)
-        gb_loss = self._vicreg_loss(proj_orig, proj_gb,
-                                     sim_weight=1.0, var_weight=var_w, cov_weight=cov_w)  # orig=teacher(sg), gb=student
-
-        # Site adversarial loss (on original graph calibrated features)
-        site_adv_loss = torch.tensor(0.0, device=data.x.device)
-        if (self.model.site_calibration.site_classifier is not None
-                and hasattr(view_orig, 'env_id')):
-            site_labels = view_orig.env_id
-            if site_labels is not None:
-                model = self.model
-                node_feat = view_orig.x if not model.use_cnn else None
-                if node_feat is not None:
-                    batch_idx = view_orig.batch if view_orig.batch is not None else torch.zeros(
-                        node_feat.size(0), dtype=torch.long, device=node_feat.device)
-                    h_calib, _ = model.site_calibration(node_feat, batch_idx)
-                    grl_lam = self.config.train.alpha
-                    site_adv_loss = model.site_calibration.site_adversarial_loss(
-                        h_calib, batch_idx, site_labels, grl_lambda=grl_lam)
-
-        return {
-            'gb_loss': gb_loss,
-            'site_adv_loss': site_adv_loss,
-        }
-
-    def _extract_graph_embedding(self, data: Batch, return_calib_info: bool = False):
-        """Extract graph-level embedding from the shared encoder (Calibration+GNN).
-
-        Reuses the same feature extraction path as classification but stops before classifier.
-
-        Args:
-            data: batched graph data
-            return_calib_info: if True, also return calibration info (for gate-cons loss)
-
-        Returns:
-            graph_emb or (graph_emb, calib_info)
-        """
-        model = self.model
-        if model.use_cnn:
-            x = data.x.unsqueeze(1)
-            x = model.cnn(x)
-            x = model.pool(x)
-            x = x.transpose(1, 2)
-            lstm_out, _ = model.lstm(x)
-            node_features = lstm_out[:, -1, :]
-        else:
-            node_features = data.x
-
-        # Site calibration (always applied)
-        batch_idx = data.batch if data.batch is not None else torch.zeros(
-            node_features.size(0), dtype=torch.long, device=node_features.device)
-        node_features, calib_info = model.site_calibration(node_features, batch_idx)
-        graph_emb, _ = model.gnn(node_features, data=data, ood_algorithm=self.ood_algorithm)
-        if return_calib_info:
-            return graph_emb, calib_info
-        return graph_emb
-
-    def _extract_graph_embedding_shared_calib(self, data: Batch, calib_info: dict) -> torch.Tensor:
-        """Extract graph embedding using pre-computed calibration params.
-
-        Instead of running SiteCalibration.forward() (which re-estimates stats),
-        uses apply_params() with the gamma/beta/gate from the original graph.
-        """
-        model = self.model
-        if model.use_cnn:
-            x = data.x.unsqueeze(1)
-            x = model.cnn(x)
-            x = model.pool(x)
-            x = x.transpose(1, 2)
-            lstm_out, _ = model.lstm(x)
-            node_features = lstm_out[:, -1, :]
-        else:
-            node_features = data.x
-
-        batch_idx = data.batch if data.batch is not None else torch.zeros(
-            node_features.size(0), dtype=torch.long, device=node_features.device)
-        node_features = model.site_calibration.apply_params(
-            node_features, batch_idx,
-            calib_info['gamma'], calib_info['beta'], calib_info['gate'])
-        graph_emb, _ = model.gnn(node_features, data=data, ood_algorithm=self.ood_algorithm)
-        return graph_emb
 
     def train_batch(self, data: Batch, pbar) -> dict:
         r"""
-        Train a batch: classification loss + cross-scale contrastive regularization.
-        Single-stage training, no separate pretrain phase.
+        Train a batch: classification + GBCR losses.
+
+        GBCR is embedded in the GNN forward pass (between GAT layers).
+        After forward, we extract GBCR info for auxiliary losses:
+          - L_align: class-conditional ball importance alignment across sites
+          - L_entropy: assignment entropy (balanced balls)
+          - L_site: site adversarial on calibrated features
+
+        Stage 1 (epoch < gate_warmup): cls only + sparse gate reg
+        Stage 2 (gate_warmup <=): cls + GBCR losses + site_adv
         """
         data = data.to(self.config.device)
         self.ood_algorithm.optimizer.zero_grad()
 
-        # --- 1. Classification loss ---
+        # --- 1. Forward pass (GBCR runs inside GNN automatically) ---
         mask, targets = nan2zero_get_mask(data, 'train', self.config)
         node_norm = data.get('node_norm') if self.config.model.model_level == 'node' else None
         node_norm = node_norm.reshape(targets.shape) if node_norm is not None else None
@@ -205,45 +79,63 @@ class Pipeline:
         cls_loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
         cls_loss = self.ood_algorithm.loss_postprocess(cls_loss, data, mask, self.config)
 
-        # --- 2. Staged regularization ---
+        # --- 2. GBCR auxiliary losses ---
         epoch = self.config.train.epoch
         gate_warmup = getattr(self.config.train, 'gate_warmup_epoch', 10)
-        contrastive_warmup = getattr(self.config.train, 'contrastive_warmup_epoch', 20)
 
-        gb_weight = getattr(self.config.train, 'gb_weight', 0.0)
-        gb_loss_val = 0.0
+        align_val = 0.0
+        entropy_val = 0.0
         site_adv_val = 0.0
 
-        # Stage 1 (epoch < gate_warmup): only cls + sparse gate reg (via loss_postprocess)
-        # Stage 2 (gate_warmup <= epoch < contrastive_warmup): + gate_cons + site_adv
-        # Stage 3 (epoch >= contrastive_warmup): + contrastive (VICReg)
+        if epoch >= gate_warmup and getattr(data, 'num_graphs', 1) >= 2:
+            gbcr_info = self.model.get_gbcr_info()
 
-        if epoch >= gate_warmup and gb_weight > 0 and getattr(data, 'num_graphs', 1) >= 2:
-            reg_dict = self._compute_contrastive_reg(data)
+            if gbcr_info is not None:
+                # Access the GBCR module from the encoder
+                gbcr_module = self.model.gnn.encoder.gbcr
 
-            # Site adversarial (stage 2+)
+                # Class-conditional importance alignment across sites
+                lambda_align = getattr(self.config.ood, 'gbcr_align_weight', 0.1)
+                if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
+                    align_loss = gbcr_module.importance_alignment_loss(
+                        data.batch, data.y.view(-1), data.env_id)
+                    if align_loss.item() > 0:
+                        align_val = align_loss.item()
+                        cls_loss = cls_loss + lambda_align * align_loss
+
+                # Assignment entropy (balanced balls)
+                lambda_entropy = getattr(self.config.ood, 'gbcr_entropy_weight', 0.05)
+                entropy_loss = gbcr_module.assignment_entropy_loss()
+                if entropy_loss.item() > 0:
+                    entropy_val = entropy_loss.item()
+                    cls_loss = cls_loss + lambda_entropy * entropy_loss
+
+            # Site adversarial loss
             site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
-            if site_adv_w > 0 and reg_dict['site_adv_loss'].item() > 0:
-                site_adv_val = reg_dict['site_adv_loss'].item()
-                cls_loss = cls_loss + site_adv_w * reg_dict['site_adv_loss']
-
-            # Contrastive VICReg (stage 3 only)
-            if epoch >= contrastive_warmup:
-                gb_loss_val = reg_dict['gb_loss'].item()
-                cls_loss = cls_loss + gb_weight * reg_dict['gb_loss']
+            if site_adv_w > 0 and self.model.site_calibration.site_classifier is not None:
+                if hasattr(data, 'env_id') and data.env_id is not None:
+                    node_feat = data.x if not self.model.use_cnn else None
+                    if node_feat is not None:
+                        batch_idx = data.batch if data.batch is not None else torch.zeros(
+                            node_feat.size(0), dtype=torch.long, device=node_feat.device)
+                        h_calib, _ = self.model.site_calibration(node_feat, batch_idx)
+                        grl_lam = self.config.train.alpha
+                        site_adv_loss = self.model.site_calibration.site_adversarial_loss(
+                            h_calib, batch_idx, data.env_id, grl_lambda=grl_lam)
+                        if site_adv_loss.item() > 0:
+                            site_adv_val = site_adv_loss.item()
+                            cls_loss = cls_loss + site_adv_w * site_adv_loss
 
         cls_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
 
         # Store for logging
-        if gb_weight > 0:
-            self.ood_algorithm.spec_loss = {
-                'GB': gb_loss_val,
-                'SiteAdv': site_adv_val,
-            }
-        else:
-            self.ood_algorithm.spec_loss = None
+        self.ood_algorithm.spec_loss = {
+            'Align': align_val,
+            'Entropy': entropy_val,
+            'SiteAdv': site_adv_val,
+        }
 
         return {'loss': cls_loss.detach()}
 
@@ -259,7 +151,6 @@ class Pipeline:
 
         max_epochs = self.config.train.max_epoch
         patience = getattr(self.config.train, 'patience', 15)
-        contrastive_warmup = getattr(self.config.train, 'contrastive_warmup_epoch', 20)
 
         # --- Decision 2 & 3: MA5 scoring + local-peak top-3 checkpoints ---
         score_history = []  # raw S_t per epoch
@@ -267,10 +158,6 @@ class Pipeline:
         min_peak_gap = 4  # min epochs between saved peaks
         # Each entry: (ma5_score, epoch, ckpt_path) - only local peaks
         peak_ckpts = []
-        best_stage2_ma5 = -1.0
-        # Decision 4: stage3 gate
-        stage3_consecutive_better = 0
-        stage3_allowed = False
 
         patience_counter = 0
         best_patience_score = -1.0
@@ -337,16 +224,11 @@ class Pipeline:
             torch.save(ckpt, ckpt_path)
             shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
 
-            # --- Decision 1 & 4: Stage-aware checkpoint selection ---
-            in_stage3 = epoch >= contrastive_warmup
+            # --- Checkpoint selection: local peak with min gap ---
             is_candidate = epoch >= 3  # skip first 3 epochs
 
-            if is_candidate and not in_stage3:
-                # Stage 2: always eligible for main results
-                if ma5 > best_stage2_ma5:
-                    best_stage2_ma5 = ma5
-
-                # Local peak detection: S_t higher than previous
+            if is_candidate:
+                # Local peak detection: S_t higher than previous 2 values
                 is_local_peak = len(score_history) >= 2 and s_t >= score_history[-2]
                 if len(score_history) >= 3:
                     is_local_peak = is_local_peak and s_t >= score_history[-3]
@@ -365,7 +247,7 @@ class Pipeline:
                                 os.unlink(old_path)
                             except OSError:
                                 pass
-                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (stage2, LOCAL PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
+                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (LOCAL PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
                 else:
                     if os.path.exists(ckpt_path) and not ckpt_path.endswith(f'last{fold}.ckpt'):
                         try:
@@ -373,57 +255,17 @@ class Pipeline:
                         except OSError:
                             pass
                     reason = 'not peak' if not is_local_peak else f'gap={epoch - last_peak_epoch}<{min_peak_gap}'
-                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (stage2, {reason})')
+                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} ({reason})')
 
-            elif is_candidate and in_stage3:
-                # Decision 4: stage3 only enters if MA5 > best_stage2 + 0.02 for 3 consecutive epochs
-                if ma5 > best_stage2_ma5 + 0.02:
-                    stage3_consecutive_better += 1
-                else:
-                    stage3_consecutive_better = 0
 
-                if stage3_consecutive_better >= 3:
-                    stage3_allowed = True
-
-                if stage3_allowed:
-                    is_local_peak = len(score_history) >= 2 and s_t >= score_history[-2]
-                    last_peak_epoch = peak_ckpts[-1][1] if peak_ckpts else -999
-                    has_min_gap = (epoch - last_peak_epoch) >= min_peak_gap
-
-                    if is_local_peak and has_min_gap:
-                        peak_ckpts.append((ma5, epoch, ckpt_path))
-                        peak_ckpts.sort(key=lambda x: x[0], reverse=True)
-                        while len(peak_ckpts) > top_k:
-                            _, _, old_path = peak_ckpts.pop()
-                            if os.path.exists(old_path):
-                                try:
-                                    os.unlink(old_path)
-                                except OSError:
-                                    pass
-                        print(f'#IN#  MA5={ma5:.4f} (stage3 ALLOWED, PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
-                    else:
-                        if os.path.exists(ckpt_path):
-                            try:
-                                os.unlink(ckpt_path)
-                            except OSError:
-                                pass
-                        print(f'#IN#  MA5={ma5:.4f} (stage3 ALLOWED, not peak)')
-                else:
-                    print(f'#IN#  MA5={ma5:.4f} (stage3, not yet qualified, streak={stage3_consecutive_better}/3)')
-                    if os.path.exists(ckpt_path):
-                        try:
-                            os.unlink(ckpt_path)
-                        except OSError:
-                            pass
-
-            # --- Early stopping on MA3 ---
+            # --- Early stopping ---
             if ma5 > best_patience_score:
                 best_patience_score = ma5
                 patience_counter = 0
             else:
                 patience_counter += 1
             if patience_counter >= patience:
-                print(f'#IN# Early stopping at epoch {epoch} (best MA3: {best_patience_score:.4f})')
+                print(f'#IN# Early stopping at epoch {epoch} (best MA5: {best_patience_score:.4f})')
                 break
 
             self.ood_algorithm.scheduler.step()

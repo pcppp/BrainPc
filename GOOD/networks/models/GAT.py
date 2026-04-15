@@ -149,7 +149,11 @@ class GATEncoder(BasicEncoder):
         # Layer 1: standard GATConv
         self.conv1 = gnn.GATConv(config.dataset.dim_node, config.model.dim_hidden, heads=heads)
 
-        # GBCR: inserted between layer 1 and layer 2
+        # Site calibration: placed between GAT1 and GBCR (set externally by GDGMT)
+        self.site_calibration = None
+        self._calib_info = None
+
+        # GBCR: inserted after calibration, before layer 2
         num_balls = getattr(config.model, 'num_balls', 14)
         alpha_node = getattr(config.model, 'gbcr_alpha_node', 0.15)
         alpha_edge = getattr(config.model, 'gbcr_alpha_edge', 0.25)
@@ -188,9 +192,19 @@ class GATEncoder(BasicEncoder):
         # Layer 1: standard GAT
         post_conv = self.dropout1(self.relu1(self.batch_norm1(self.conv1(x, edge_index, edge_weight))))
 
-        # GBCR: granular-ball cross-reweight
+        # Site calibration: applied on mid-level H1 (after GAT1, before GBCR)
         if batch is None:
             batch = torch.zeros(post_conv.size(0), dtype=torch.long, device=post_conv.device)
+        if self.site_calibration is not None:
+            post_conv, calib_info = self.site_calibration(
+                post_conv, batch, edge_index=edge_index, edge_weight=edge_weight)
+            self._calib_info = calib_info
+            self._h_calibrated = post_conv  # store for SiteAdv loss
+        else:
+            self._calib_info = None
+            self._h_calibrated = None
+
+        # GBCR: granular-ball cross-reweight (after calibration)
         post_conv, edge_importance, gbcr_info = self.gbcr(post_conv, edge_index, batch)
         # Store GBCR info for loss computation (accessible from model)
         self._gbcr_info = gbcr_info

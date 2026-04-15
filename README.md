@@ -73,3 +73,15 @@ If you have any questions, please feel free to reach out at `jiaxing003@e.ntu.ed
 2. MA5 checkpoint selection: Uses 5-epoch moving average of S_t = 0.6*BA_OOD_val + 0.2*AUROC_OOD_val + 0.2*BA_ID_val. BA (balanced accuracy) better handles low positive-ratio sites; AUROC is threshold-invariant.
 3. Local-peak top-3 ensemble: Only saves checkpoints at local S_t peaks with min 4-epoch gap for diversity, then takes top-3 by MA5. Test-time averages softmax probs with threshold tuned on OOD_val to maximize balanced accuracy.
 4. Stage-3 gating: GB/VICReg stage only enters main results if MA5 > best_stage2 + 0.02 for 3 consecutive epochs.
+
+
+## Site Calibration (v2)
+
+The sample-level statistical-aware calibration module has been refactored:
+
+- **Position**: Moved from input (before GNN) to between GAT layer 1 and layer 2 (mid-level H₁)
+- **Form**: Constrained affine — γ ∈ [0.9, 1.1], β ∈ [-0.1, 0.1], with fixed α=0.1 residual scaling
+- **Input**: Meta-network now sees both node feature stats AND edge distribution stats (mean/std of |A|, density, positive edge ratio)
+- **Training**: 3-stage schedule — gate-only (0-10), +SiteAdv (10-20), freeze gate + GBCR (20+)
+- **Losses**: L_aff (affine constraint) + L_sp (gate sparsity) + L_gate-align (class-conditional gate alignment)
+- **Monitoring**: Every epoch prints mean(g), std(g), ||γ-1||, ||β|| for gate interpretability

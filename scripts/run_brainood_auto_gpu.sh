@@ -50,4 +50,12 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
-python -m GOOD.kernel.main --config_path "$CONFIG_PATH" --gpu_idx 0 "$@"
+# --- Log console output ---
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '_' || echo 'unknown')"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/run_${TIMESTAMP}_${BRANCH}.log"
+echo "#IN# Logging to $LOG_FILE"
+
+python -m GOOD.kernel.main --config_path "$CONFIG_PATH" --gpu_idx 0 "$@" 2>&1 | tee "$LOG_FILE"

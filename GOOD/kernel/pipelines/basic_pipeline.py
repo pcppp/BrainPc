@@ -57,8 +57,10 @@ class Pipeline:
           - L_entropy: assignment entropy (balanced balls)
           - L_site: site adversarial on calibrated features
 
-        Stage 1 (epoch < gate_warmup): cls only + sparse gate reg
-        Stage 2 (gate_warmup <=): cls + GBCR losses + site_adv
+        Staged training:
+        Stage 1 (epoch < gate_warmup): cls + gate losses (affine_reg, gate_sparsity, gate_align)
+        Stage 2 (gate_warmup <= epoch < gbcr_warmup): + SiteAdv
+        Stage 3 (gbcr_warmup <=): freeze gate, + GBCR losses (align, entropy)
         """
         data = data.to(self.config.device)
         self.ood_algorithm.optimizer.zero_grad()
@@ -79,29 +81,79 @@ class Pipeline:
         cls_loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
         cls_loss = self.ood_algorithm.loss_postprocess(cls_loss, data, mask, self.config)
 
-        # --- 2. GBCR auxiliary losses ---
+        # --- 2. Staged auxiliary losses ---
         epoch = self.config.train.epoch
-        gate_warmup = getattr(self.config.train, 'gate_warmup_epoch', 10)
+        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 10)
+        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 20)
 
         align_val = 0.0
         entropy_val = 0.0
         site_adv_val = 0.0
+        gate_align_val = 0.0
 
-        if epoch >= gate_warmup and getattr(data, 'num_graphs', 1) >= 2:
+        # --- Stage 1 (always): gate regularization ---
+        calib_info = self.model.calib_info
+        if calib_info:
+            # L_aff = ||gamma-1||^2 + ||beta||^2
+            affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.01)
+            cls_loss = cls_loss + affine_w * calib_info['affine_reg']
+
+            # L_sp = ||g||_1
+            gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.01)
+            cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
+
+            # L_gate-align: class-conditional gate alignment across sites
+            if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
+                gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.05)
+                gate_align_loss = self.model.site_calibration.gate_alignment_loss(
+                    calib_info['gate'], None, data.y.view(-1), data.env_id)
+                gate_align_val = gate_align_loss.item()
+                cls_loss = cls_loss + gate_align_w * gate_align_loss
+
+        # --- Stage 2 (epoch >= site_adv_warmup): add SiteAdv ---
+        if epoch >= site_adv_warmup and getattr(data, 'num_graphs', 1) >= 2:
+            site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
+            if site_adv_w > 0 and self.model.site_calibration.site_classifier is not None:
+                if hasattr(data, 'env_id') and data.env_id is not None:
+                    # Use calibrated features from encoder (already computed in forward)
+                    encoder = self.model.gnn.encoder
+                    if encoder._calib_info is not None:
+                        batch_idx = data.batch if data.batch is not None else torch.zeros(
+                            data.x.size(0), dtype=torch.long, device=data.x.device)
+                        # Get post-GAT1+calib node features for site adversarial
+                        # We reuse the encoder's stored calibrated output
+                        # Actually run site_adv on the graph-level pooled calibrated features
+                        grl_lam = self.config.train.alpha
+                        # Forward through site_calibration was already done in encoder
+                        # We need the calibrated H for site_adv — it's post_conv after calib
+                        # For simplicity, re-run calibration on the stored H1
+                        # But actually, the encoder already ran it. We use the model-level
+                        # site_adversarial_loss which pools and classifies.
+                        # We need to get H_calibrated from encoder. Let's add it.
+                        if hasattr(encoder, '_h_calibrated'):
+                            site_adv_loss = self.model.site_calibration.site_adversarial_loss(
+                                encoder._h_calibrated, batch_idx, data.env_id, grl_lambda=grl_lam)
+                            site_adv_val = site_adv_loss.item()
+                            cls_loss = cls_loss + site_adv_w * site_adv_loss
+
+        # --- Stage 3 (epoch >= gbcr_warmup): freeze gate, add GBCR losses ---
+        if epoch >= gbcr_warmup and getattr(data, 'num_graphs', 1) >= 2:
+            # Freeze gate parameters
+            for p in self.model.site_calibration.parameters():
+                p.requires_grad = False
+
             gbcr_info = self.model.get_gbcr_info()
-
             if gbcr_info is not None:
-                # Access the GBCR module from the encoder
                 gbcr_module = self.model.gnn.encoder.gbcr
 
                 # Class-conditional importance alignment across sites
                 lambda_align = getattr(self.config.ood, 'gbcr_align_weight', 0.1)
                 if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
-                    align_loss = gbcr_module.importance_alignment_loss(
+                    align_loss_val = gbcr_module.importance_alignment_loss(
                         data.batch, data.y.view(-1), data.env_id)
-                    if align_loss.item() > 0:
-                        align_val = align_loss.item()
-                        cls_loss = cls_loss + lambda_align * align_loss
+                    if align_loss_val.item() > 0:
+                        align_val = align_loss_val.item()
+                        cls_loss = cls_loss + lambda_align * align_loss_val
 
                 # Assignment entropy (balanced balls)
                 lambda_entropy = getattr(self.config.ood, 'gbcr_entropy_weight', 0.05)
@@ -110,31 +162,21 @@ class Pipeline:
                     entropy_val = entropy_loss.item()
                     cls_loss = cls_loss + lambda_entropy * entropy_loss
 
-            # Site adversarial loss
-            site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
-            if site_adv_w > 0 and self.model.site_calibration.site_classifier is not None:
-                if hasattr(data, 'env_id') and data.env_id is not None:
-                    node_feat = data.x if not self.model.use_cnn else None
-                    if node_feat is not None:
-                        batch_idx = data.batch if data.batch is not None else torch.zeros(
-                            node_feat.size(0), dtype=torch.long, device=node_feat.device)
-                        h_calib, _ = self.model.site_calibration(node_feat, batch_idx)
-                        grl_lam = self.config.train.alpha
-                        site_adv_loss = self.model.site_calibration.site_adversarial_loss(
-                            h_calib, batch_idx, data.env_id, grl_lambda=grl_lam)
-                        if site_adv_loss.item() > 0:
-                            site_adv_val = site_adv_loss.item()
-                            cls_loss = cls_loss + site_adv_w * site_adv_loss
-
         cls_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
+
+        # Unfreeze gate after backward (so next epoch can decide again)
+        if epoch >= gbcr_warmup:
+            for p in self.model.site_calibration.parameters():
+                p.requires_grad = False  # keep frozen from gbcr_warmup onward
 
         # Store for logging
         self.ood_algorithm.spec_loss = {
             'Align': align_val,
             'Entropy': entropy_val,
             'SiteAdv': site_adv_val,
+            'GateAlign': gate_align_val,
         }
 
         return {'loss': cls_loss.detach()}
@@ -468,7 +510,11 @@ class Pipeline:
             acc = (preds == targets).float().mean().item()
             from sklearn.metrics import balanced_accuracy_score as ba_score
             from sklearn.metrics import roc_auc_score as sk_auroc
+            from sklearn.metrics import precision_score, recall_score, f1_score
             ba = ba_score(targets.numpy(), preds.numpy())
+            prec = precision_score(targets.numpy(), preds.numpy(), zero_division=0)
+            rec = recall_score(targets.numpy(), preds.numpy(), zero_division=0)
+            f1 = f1_score(targets.numpy(), preds.numpy(), zero_division=0)
             try:
                 auroc = sk_auroc(targets.numpy(), prob_class1.numpy())
             except ValueError:
@@ -479,6 +525,9 @@ class Pipeline:
             result_ckpt[f'{prefix}_score'] = acc
             result_ckpt[f'{prefix}_balanced_accuracy'] = ba
             result_ckpt[f'{prefix}_roc_auc'] = auroc
+            result_ckpt[f'{prefix}_precision'] = prec
+            result_ckpt[f'{prefix}_recall'] = rec
+            result_ckpt[f'{prefix}_f1'] = f1
             print(f'  Ensemble {split}: acc={acc:.4f}, BA={ba:.4f}, AUROC={auroc:.4f} (thr={best_threshold:.2f})')
 
         # Fill in required fields for backward compat
@@ -489,13 +538,11 @@ class Pipeline:
             result_ckpt[key] = torch.tensor(0.0)
         result_ckpt['val_score'] = result_ckpt.get('ood_val_score', 0)
         result_ckpt['test_score'] = result_ckpt.get('ood_test_score', 0)
-        for suffix in ['precision', 'recall', 'f1', 'roc_auc']:
-            result_ckpt[f'id_test_{suffix}'] = result_ckpt.get('id_test_score', 0)
-            result_ckpt[f'ood_test_{suffix}'] = result_ckpt.get('ood_test_score', 0)
-        result_ckpt['id_val_subject_num'] = 1
-        result_ckpt['id_test_subject_num'] = 1
-        result_ckpt['ood_val_subject_num'] = 1
-        result_ckpt['ood_test_subject_num'] = 1
+        # precision/recall/f1/roc_auc computed properly per split above
+        result_ckpt['id_val_subject_num'] = len(targets_dict.get('id_val', []))
+        result_ckpt['id_test_subject_num'] = len(targets_dict.get('id_test', []))
+        result_ckpt['ood_val_subject_num'] = len(targets_dict.get('val', []))
+        result_ckpt['ood_test_subject_num'] = len(targets_dict.get('test', []))
 
         return result_ckpt
 

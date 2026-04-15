@@ -1,15 +1,14 @@
 """
 Sample-level statistical-aware site calibration module.
+Placed between GAT layer 1 and layer 2 (mid-level representations).
 
-Residual affine modulation with meta-network generated parameters.
-Suppresses site/scanner style shift while preserving disease-relevant signals.
-
-Design:
-  - Extract per-sample statistics s = [mean(H), std(H)]  (stop-gradient)
-  - Small meta-network: s -> (gamma, beta, gate)  channel-wise
-  - Sample-internal standardization: H_norm = (H - mu) / (sigma + eps)
-  - Residual calibration: H' = H + gate * (gamma * H_norm + beta - H)
-  - gate initialized near 0 (identity by default)
+Design changes (v2):
+  - Input: per-graph stats from both H (node features) AND edge weights
+    s = [mean(H), std(H), mean(|A|), std(|A|), density, pos_ratio]
+  - Constrained affine: gamma = 1 + 0.1*tanh(gamma_hat), beta = 0.1*tanh(beta_hat)
+  - Residual form: H' = H + alpha * g * (gamma * H_norm + beta - H)
+  - alpha fixed at 0.1 to limit calibration magnitude
+  - Class-conditional gate alignment loss for domain generalization
 """
 
 import torch
@@ -34,36 +33,42 @@ def grad_reverse(x, lam=1.0):
 
 
 class SiteCalibration(nn.Module):
-    """Sample-level residual site calibration via meta-network affine modulation.
+    """Sample-level residual site calibration via meta-network.
 
-    Only generates channel-wise parameters to avoid overfitting on small datasets.
-    Bottleneck = d/8 for small-sample regime.
+    v2: constrained form, edge stats input, placed after GAT layer 1.
 
     Args:
-        feat_dim: dimension of node features
-        gate_init_bias: initial bias for gate (negative = near-zero gate = near-identity)
+        feat_dim: dimension of node features (= dim_hidden after GAT1)
+        gate_init_bias: initial bias for gate logit (negative = near-zero gate)
         num_sites: number of sites for adversarial classifier (0 = disable)
+        alpha: residual scaling factor (fixed, not learned)
+        scale_bound: bound for tanh scaling of gamma/beta
     """
 
-    def __init__(self, feat_dim: int, gate_init_bias: float = -3.0, num_sites: int = 0):
+    def __init__(self, feat_dim: int, gate_init_bias: float = -3.0,
+                 num_sites: int = 0, alpha: float = 0.1, scale_bound: float = 0.1):
         super().__init__()
         self.feat_dim = feat_dim
+        self.alpha = alpha
+        self.scale_bound = scale_bound
 
-        # Meta-network: 2d -> d/8 -> 3d  (very small for small-sample)
+        # Meta-network input: 2*feat_dim (H stats) + 4 (edge stats)
+        # Edge stats: mean(|edge_weight|), std(|edge_weight|), density, positive_edge_ratio
+        stat_dim = 2 * feat_dim + 4
         bottleneck = max(feat_dim // 8, 8)
         self.meta_net = nn.Sequential(
-            nn.Linear(2 * feat_dim, bottleneck),
+            nn.Linear(stat_dim, bottleneck),
             nn.ReLU(inplace=True),
-            nn.Linear(bottleneck, 3 * feat_dim),
+            nn.Linear(bottleneck, 3 * feat_dim),  # gamma_hat, beta_hat, gate_logit
         )
 
-        # Initialize: gamma~1, beta~0, gate~sigmoid(gate_init_bias)~0.05
+        # Initialize: gamma_hat~0 (so gamma=1), beta_hat~0, gate near 0
         with torch.no_grad():
-            final_layer = self.meta_net[-1]
-            final_layer.weight.zero_()
-            final_layer.bias[:feat_dim].fill_(1.0)       # gamma = 1
-            final_layer.bias[feat_dim:2*feat_dim].zero_() # beta = 0
-            final_layer.bias[2*feat_dim:].fill_(gate_init_bias)  # gate near 0
+            final = self.meta_net[-1]
+            final.weight.zero_()
+            final.bias[:feat_dim].zero_()             # gamma_hat = 0 -> gamma = 1
+            final.bias[feat_dim:2*feat_dim].zero_()   # beta_hat = 0 -> beta = 0
+            final.bias[2*feat_dim:].fill_(gate_init_bias)  # gate near 0
 
         # Site adversarial classifier (gradient reversal)
         if num_sites > 0:
@@ -75,99 +80,143 @@ class SiteCalibration(nn.Module):
         else:
             self.site_classifier = None
 
-    def forward(self, H: torch.Tensor, batch: torch.Tensor):
+    def _compute_edge_stats(self, edge_weight, edge_index, batch, num_graphs, device):
+        """Compute per-graph edge statistics: mean(|w|), std(|w|), density, pos_ratio."""
+        edge_stats = torch.zeros(num_graphs, 4, device=device)
+
+        if edge_weight is None or edge_weight.numel() == 0:
+            return edge_stats
+
+        abs_w = edge_weight.abs()
+        # Assign each edge to its source node's graph
+        edge_batch = batch[edge_index[0]]
+
+        for g in range(num_graphs):
+            mask = (edge_batch == g)
+            if mask.sum() == 0:
+                continue
+            w_g = abs_w[mask]
+            n_nodes = (batch == g).sum().float()
+            n_edges = mask.sum().float()
+
+            edge_stats[g, 0] = w_g.mean()                           # mean(|A|)
+            edge_stats[g, 1] = w_g.std() if w_g.numel() > 1 else 0  # std(|A|)
+            max_edges = n_nodes * (n_nodes - 1)  # directed graph max
+            edge_stats[g, 2] = n_edges / max_edges.clamp(min=1)      # density
+            edge_stats[g, 3] = (edge_weight[mask] > 0).float().mean() # pos_ratio
+
+        return edge_stats
+
+    def forward(self, H, batch, edge_index=None, edge_weight=None):
         """
         Args:
-            H: node features [N_total, feat_dim]
+            H: node features [N_total, feat_dim] (after GAT layer 1)
             batch: batch indicator [N_total]
+            edge_index: [2, E] edge indices
+            edge_weight: [E] edge weights (can be None)
 
         Returns:
             H_calibrated: [N_total, feat_dim]
-            calib_info: dict with gate_reg, affine_reg, gamma, beta, gate
+            calib_info: dict with monitoring values
         """
+        device = H.device
         num_graphs = int(batch.max().item()) + 1
-        graph_mean = torch.zeros(num_graphs, self.feat_dim, device=H.device)
-        graph_count = torch.zeros(num_graphs, 1, device=H.device)
 
-        graph_count.index_add_(0, batch, torch.ones(H.size(0), 1, device=H.device))
-        graph_mean.index_add_(0, batch, H.detach())  # stop-gradient
+        # --- Per-graph node feature statistics (stop-gradient) ---
+        graph_mean = torch.zeros(num_graphs, self.feat_dim, device=device)
+        graph_count = torch.zeros(num_graphs, 1, device=device)
+        graph_count.index_add_(0, batch, torch.ones(H.size(0), 1, device=device))
+        graph_mean.index_add_(0, batch, H.detach())
         graph_mean = graph_mean / graph_count.clamp(min=1)
 
-        graph_sq = torch.zeros(num_graphs, self.feat_dim, device=H.device)
+        graph_sq = torch.zeros(num_graphs, self.feat_dim, device=device)
         graph_sq.index_add_(0, batch, (H.detach()) ** 2)
         graph_sq = graph_sq / graph_count.clamp(min=1)
         graph_var = (graph_sq - graph_mean ** 2).clamp(min=1e-6)
         graph_std = graph_var.sqrt()
 
-        stats = torch.cat([graph_mean, graph_std], dim=1)
-        params = self.meta_net(stats)
-        gamma = params[:, :self.feat_dim]
-        beta = params[:, self.feat_dim:2*self.feat_dim]
-        gate_logits = params[:, 2*self.feat_dim:]
-        gate = torch.sigmoid(gate_logits)
+        # --- Edge statistics ---
+        edge_stats = self._compute_edge_stats(edge_weight, edge_index, batch, num_graphs, device)
 
+        # --- Meta-network: [mean(H), std(H), edge_stats] -> (gamma_hat, beta_hat, gate_logit) ---
+        stats = torch.cat([graph_mean, graph_std, edge_stats], dim=1)
+        params = self.meta_net(stats)
+        gamma_hat = params[:, :self.feat_dim]
+        beta_hat = params[:, self.feat_dim:2*self.feat_dim]
+        gate_logit = params[:, 2*self.feat_dim:]
+
+        # --- Constrained parameters ---
+        gamma = 1.0 + self.scale_bound * torch.tanh(gamma_hat)  # [1-0.1, 1+0.1]
+        beta = self.scale_bound * torch.tanh(beta_hat)            # [-0.1, 0.1]
+        gate = torch.sigmoid(gate_logit)                          # [0, 1]
+
+        # --- Broadcast to node level ---
         gamma_n = gamma[batch]
         beta_n = beta[batch]
         gate_n = gate[batch]
         mean_n = graph_mean[batch]
         std_n = graph_std[batch]
 
+        # --- Sample-internal standardization ---
         H_norm = (H - mean_n) / (std_n + 1e-6)
 
-        # H' = H + g * (gamma * H_norm + beta - H)
-        H_calibrated = H + gate_n * (gamma_n * H_norm + beta_n - H)
+        # --- Residual calibration: H' = H + alpha * g * (gamma * H_norm + beta - H) ---
+        H_calibrated = H + self.alpha * gate_n * (gamma_n * H_norm + beta_n - H)
 
-        # L_sparse = ||g||_1
-        gate_reg = gate.mean()
-        # L_affine = ||gamma - 1||^2 + ||beta||^2  (encourage identity)
-        affine_reg = (gamma - 1).pow(2).mean() + beta.pow(2).mean()
+        # --- Monitoring values ---
+        gate_reg = gate.mean()  # L_sp = ||g||_1
+        affine_reg = (gamma - 1).pow(2).mean() + beta.pow(2).mean()  # L_aff
 
         calib_info = {
             'gate_reg': gate_reg,
             'affine_reg': affine_reg,
-            'gamma': gamma,
+            'gamma': gamma,        # [num_graphs, feat_dim]
             'beta': beta,
             'gate': gate,
+            'gate_logit': gate_logit,
+            # Scalar monitoring values
+            'gate_mean': gate.mean().item(),
+            'gate_std': gate.std().item(),
+            'gamma_dev': (gamma - 1).pow(2).mean().sqrt().item(),  # ||gamma-1||
+            'beta_norm': beta.pow(2).mean().sqrt().item(),         # ||beta||
         }
 
         return H_calibrated, calib_info
 
-    def apply_params(self, H: torch.Tensor, batch: torch.Tensor,
-                     gamma: torch.Tensor, beta: torch.Tensor, gate: torch.Tensor):
-        """Apply pre-computed calibration params to a different view.
+    def gate_alignment_loss(self, gate, batch_graph, labels, env_ids):
+        """Class-conditional gate alignment across sites.
 
-        Used to share the same calibration (estimated from original graph)
-        with the granular-ball coarse view, avoiding scale-mismatch artifacts.
+        L_gate-align = sum_c sum_s ||g_bar_{s,c} - g_bar_c||^2
+
+        Same disease class across different sites should have similar gate patterns.
 
         Args:
-            H: node features [N_total, feat_dim] of the target view
-            batch: batch indicator [N_total]
-            gamma, beta, gate: [num_graphs, feat_dim] from a prior forward() call
+            gate: [num_graphs, feat_dim] gate values
+            batch_graph: not used (gate is already per-graph)
+            labels: [num_graphs] class labels
+            env_ids: [num_graphs] site/environment IDs
         """
-        num_graphs = int(batch.max().item()) + 1
+        loss = torch.tensor(0.0, device=gate.device)
+        classes = labels.unique()
+        count = 0
 
-        # Per-node stats from the target view (for normalization only)
-        graph_mean = torch.zeros(num_graphs, self.feat_dim, device=H.device)
-        graph_count = torch.zeros(num_graphs, 1, device=H.device)
-        graph_count.index_add_(0, batch, torch.ones(H.size(0), 1, device=H.device))
-        graph_mean.index_add_(0, batch, H.detach())
-        graph_mean = graph_mean / graph_count.clamp(min=1)
+        for c in classes:
+            c_mask = (labels == c)
+            if c_mask.sum() < 2:
+                continue
+            g_c = gate[c_mask]           # gates for class c
+            g_bar_c = g_c.mean(dim=0)    # global mean for class c
+            envs_c = env_ids[c_mask]
 
-        graph_sq = torch.zeros(num_graphs, self.feat_dim, device=H.device)
-        graph_sq.index_add_(0, batch, (H.detach()) ** 2)
-        graph_sq = graph_sq / graph_count.clamp(min=1)
-        graph_std = (graph_sq - graph_mean ** 2).clamp(min=1e-6).sqrt()
+            for s in envs_c.unique():
+                s_mask = (envs_c == s)
+                if s_mask.sum() < 1:
+                    continue
+                g_bar_sc = g_c[s_mask].mean(dim=0)  # mean for site s, class c
+                loss = loss + (g_bar_sc - g_bar_c).pow(2).mean()
+                count += 1
 
-        # Broadcast to node level
-        gamma_n = gamma[batch]
-        beta_n = beta[batch]
-        gate_n = gate[batch]
-        mean_n = graph_mean[batch]
-        std_n = graph_std[batch]
-
-        H_norm = (H - mean_n) / (std_n + 1e-6)
-        H_calibrated = H + gate_n * (gamma_n * H_norm + beta_n - H)
-        return H_calibrated
+        return loss / max(count, 1)
 
     def site_adversarial_loss(self, H_calibrated, batch, site_labels, grl_lambda=1.0):
         """Site adversarial loss on calibrated features (gradient reversal)."""
@@ -184,14 +233,4 @@ class SiteCalibration(nn.Module):
         graph_feat_rev = grad_reverse(graph_feat, grl_lambda)
         site_logits = self.site_classifier(graph_feat_rev)
         loss = torch.nn.functional.cross_entropy(site_logits, site_labels.long())
-        return loss
-
-    @staticmethod
-    def gate_consistency_loss(calib_info_1, calib_info_2):
-        """Same sample two views should have similar gate params."""
-        loss = (
-            (calib_info_1['gate'] - calib_info_2['gate']).abs().mean() +
-            (calib_info_1['gamma'] - calib_info_2['gamma']).abs().mean() +
-            (calib_info_1['beta'] - calib_info_2['beta']).abs().mean()
-        )
         return loss

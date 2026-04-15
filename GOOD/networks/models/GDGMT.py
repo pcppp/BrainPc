@@ -213,20 +213,20 @@ class GDGMT(GNNBasic):
         )
         self.mode = 'finetune'
 
-        # Sample-level site calibration (placed before GNN)
-        calib_dim = lstm_hidden_size if self.use_cnn else config.dataset.dim_node
-        # num_sites must cover max env_id + 1 (env_ids may not be contiguous)
+        # Sample-level site calibration (placed between GAT1 and GAT2 inside encoder)
         num_sites = getattr(config.dataset, 'num_envs', 0) or 0
-        # Safety: dataset may have non-contiguous site IDs (e.g., 0..16 with gaps)
-        # Use a generous upper bound; extra unused classes don't hurt
         num_sites = max(num_sites, 20) if num_sites > 0 else 0
         self.site_calibration = SiteCalibration(
-            feat_dim=calib_dim,
+            feat_dim=config.model.dim_hidden,  # mid-level dim after GAT1
             gate_init_bias=getattr(config.model, 'calib_gate_init', -3.0),
             num_sites=num_sites,
+            alpha=0.1,
+            scale_bound=0.1,
         )
-        self.calib_gate_reg = 0.0   # scalar, updated each forward
-        self.calib_info = {}        # dict with gamma/beta/gate, updated each forward
+        # Inject into encoder so it runs between GAT1 and GBCR
+        self.gnn.encoder.site_calibration = self.site_calibration
+        self.calib_gate_reg = 0.0
+        self.calib_info = {}
 
     def forward(self, *args, **kwargs):
         r"""
@@ -255,12 +255,8 @@ class GDGMT(GNNBasic):
         else:
             node_features = data.x  # PCA-reduced FC features
 
-        # --- Site calibration (always applied, before GNN) ---
-        batch_idx = data.batch if data.batch is not None else torch.zeros(
-            node_features.size(0), dtype=torch.long, device=node_features.device)
-        node_features, calib_info = self.site_calibration(node_features, batch_idx)
-        self.calib_gate_reg = calib_info['gate_reg']
-        self.calib_info = calib_info
+        # Site calibration runs inside GATEncoder (between GAT1 and GBCR)
+        # calib_info is retrieved after forward pass from encoder
 
         # --- Pretrain mode: projection head for contrastive learning ---
         if self.mode == 'pretrain':
@@ -281,6 +277,11 @@ class GDGMT(GNNBasic):
             x_out_drop = self.classifier_dropout(x_out) if self.training else x_out
             sampling_logits.append(self.classifier(x_out_drop))
         logits = torch.stack(sampling_logits).mean(dim=0)
+        # Retrieve calib info from encoder (set during forward)
+        encoder = self.gnn.encoder if hasattr(self.gnn, 'encoder') else None
+        if encoder is not None and encoder._calib_info is not None:
+            self.calib_info = encoder._calib_info
+            self.calib_gate_reg = encoder._calib_info['gate_reg']
         return logits, None, None
 
     def get_gbcr_info(self):

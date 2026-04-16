@@ -91,24 +91,37 @@ class Pipeline:
         site_adv_val = 0.0
         gate_align_val = 0.0
 
-        # --- Stage 1 (always): gate regularization ---
+        # --- Stage 1: gate regularization (delayed to let gate learn first) ---
+        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 10)
         calib_info = self.model.calib_info
         if calib_info:
-            # L_aff = ||gamma-1||^2 + ||beta||^2
-            affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.01)
-            cls_loss = cls_loss + affine_w * calib_info['affine_reg']
+            if epoch >= gate_reg_warmup:
+                # Linear warmup over 5 epochs after warmup starts
+                ramp = min(1.0, (epoch - gate_reg_warmup + 1) / 5.0)
 
-            # L_sp = ||g||_1
-            gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.01)
-            cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
+                # L_aff = ||gamma-1||^2 + ||beta||^2 (keeps affine mild)
+                affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.005) * ramp
+                cls_loss = cls_loss + affine_w * calib_info['affine_reg']
+
+                # L_gate-range: penalize if gate mean outside [0.03, 0.15]
+                gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.05) * ramp
+                cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
 
             # L_gate-align: class-conditional gate alignment across sites
+            # Use graph-level labels (data.y may be [num_graphs] or [num_graphs,1])
             if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
                 gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.05)
-                gate_align_loss = self.model.site_calibration.gate_alignment_loss(
-                    calib_info['gate'], None, data.y.view(-1), data.env_id)
-                gate_align_val = gate_align_loss.item()
-                cls_loss = cls_loss + gate_align_w * gate_align_loss
+                # Ensure labels and env_ids are graph-level, matching gate shape
+                y_graph = data.y.view(-1)
+                env_graph = data.env_id.view(-1)
+                num_graphs = calib_info['gate'].size(0)
+                # data.y for graph tasks: [num_graphs] or [num_graphs, 1]
+                # data.env_id: [num_graphs]
+                if y_graph.size(0) == num_graphs and env_graph.size(0) == num_graphs:
+                    gate_align_loss = self.model.site_calibration.gate_alignment_loss(
+                        calib_info['gate'], None, y_graph, env_graph)
+                    gate_align_val = gate_align_loss.item()
+                    cls_loss = cls_loss + gate_align_w * gate_align_loss
 
         # --- Stage 2 (epoch >= site_adv_warmup): add SiteAdv ---
         if epoch >= site_adv_warmup and getattr(data, 'num_graphs', 1) >= 2:
@@ -211,12 +224,14 @@ class Pipeline:
 
             self.ood_algorithm.stage_control(self.config)
 
+            last_trained_data = None
             for index, data in enumerate(self.loader['train']):
                 if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
                     continue
                 p = (index / len(self.loader['train']) + epoch) / max_epochs
                 self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
                 train_stat = self.train_batch(data, None)
+                last_trained_data = data  # aligns with encoder._h_pre_gate / _h_calibrated
                 mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
 
                 if self.ood_algorithm.spec_loss is not None:
@@ -234,6 +249,40 @@ class Pipeline:
                 for ln, lv in spec_loss.items():
                     desc += f'{ln}: {lv:.4f}|'
                 print(f'#IN#Epoch {epoch}: {desc[:-1]}')
+
+            # Gate monitoring
+            gate_info = self.model.calib_info if hasattr(self.model, 'calib_info') and self.model.calib_info else {}
+            if gate_info:
+                print(f'#IN#  Gate: mean={gate_info.get("gate_mean",0):.4f} '
+                      f'std={gate_info.get("gate_std",0):.4f} '
+                      f'||\u03b3-1||={gate_info.get("gamma_dev",0):.4f} '
+                      f'||\u03b2||={gate_info.get("beta_norm",0):.4f}')
+
+            # Site probe: pre-gate vs post-gate site classification accuracy.
+            # IMPORTANT: use last_trained_data — it is the exact batch whose forward
+            # produced encoder._h_pre_gate / _h_calibrated. Re-iterating the loader
+            # would misalign batch/env_id against the cached representations.
+            encoder = self.model.gnn.encoder if hasattr(self.model.gnn, 'encoder') else None
+            if (encoder is not None and hasattr(encoder, '_h_pre_gate')
+                    and encoder._h_pre_gate is not None and encoder._h_calibrated is not None
+                    and last_trained_data is not None
+                    and hasattr(last_trained_data, 'batch')
+                    and hasattr(last_trained_data, 'env_id')
+                    and last_trained_data.env_id is not None):
+                try:
+                    probe_batch = last_trained_data.batch.to(self.config.device)
+                    probe_env = last_trained_data.env_id.view(-1).to(self.config.device)
+                    # Sanity check: pooled graph count must match env_id count
+                    n_graphs_feat = int(probe_batch.max().item()) + 1
+                    if n_graphs_feat != probe_env.size(0):
+                        print(f'#WARN# SiteProbe skipped: n_graphs({n_graphs_feat}) != env_id({probe_env.size(0)})')
+                    else:
+                        pre_acc, post_acc = self.model.site_calibration.site_probe_accuracy(
+                            encoder._h_pre_gate, encoder._h_calibrated,
+                            probe_batch, probe_env)
+                        print(f'#IN#  SiteProbe: pre={pre_acc:.4f} post={post_acc:.4f}')
+                except Exception as e:
+                    print(f'#WARN# SiteProbe failed: {type(e).__name__}: {e}')
 
             # Evaluate
             epoch_train_stat = self.evaluate('eval_train')

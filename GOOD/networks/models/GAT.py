@@ -164,11 +164,11 @@ class GATEncoder(BasicEncoder):
             alpha_edge=alpha_edge,
         )
 
-        # Layer 2+: GATv2Conv with edge_dim=1 to accept edge importance from GBCR
+        # Layer 2+: standard GATConv (edge importance applied as edge_weight)
         self.convs = nn.ModuleList(
             [
-                gnn.GATv2Conv(config.model.dim_hidden * heads, config.model.dim_hidden,
-                              heads=heads, edge_dim=1)
+                gnn.GATConv(config.model.dim_hidden * heads, config.model.dim_hidden,
+                            heads=heads)
                 for _ in range(num_layer - 1)
             ]
         )
@@ -196,6 +196,7 @@ class GATEncoder(BasicEncoder):
         if batch is None:
             batch = torch.zeros(post_conv.size(0), dtype=torch.long, device=post_conv.device)
         if self.site_calibration is not None:
+            self._h_pre_gate = post_conv.detach()  # store pre-gate for site probe
             post_conv, calib_info = self.site_calibration(
                 post_conv, batch, edge_index=edge_index, edge_weight=edge_weight)
             self._calib_info = calib_info
@@ -210,11 +211,12 @@ class GATEncoder(BasicEncoder):
         self._gbcr_info = gbcr_info
         self._gbcr_edge_importance = edge_importance
 
-        # Layer 2+: GATv2Conv with edge importance as edge_attr
-        edge_attr = (1.0 + self.gbcr.alpha_edge * edge_importance).unsqueeze(-1)  # [E, 1]
+        # Layer 2+: standard GATConv with original edge_weight
+        # GBCR node reweighting already modifies representations;
+        # edge importance is stored for monitoring/loss only
         for i, (conv, batch_norm, relu, dropout) in enumerate(
                 zip(self.convs, self.batch_norms, self.relus, self.dropouts)):
-            post_conv = batch_norm(conv(post_conv, edge_index, edge_attr=edge_attr))
+            post_conv = batch_norm(conv(post_conv, edge_index, edge_weight))
             if i < len(self.convs) - 1:
                 post_conv = relu(post_conv)
             post_conv = dropout(post_conv)

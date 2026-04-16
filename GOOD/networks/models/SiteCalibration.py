@@ -2,13 +2,13 @@
 Sample-level statistical-aware site calibration module.
 Placed between GAT layer 1 and layer 2 (mid-level representations).
 
-Design changes (v2):
-  - Input: per-graph stats from both H (node features) AND edge weights
-    s = [mean(H), std(H), mean(|A|), std(|A|), density, pos_ratio]
-  - Constrained affine: gamma = 1 + 0.1*tanh(gamma_hat), beta = 0.1*tanh(beta_hat)
-  - Residual form: H' = H + alpha * g * (gamma * H_norm + beta - H)
-  - alpha fixed at 0.1 to limit calibration magnitude
-  - Class-conditional gate alignment loss for domain generalization
+Design (v3, revived):
+  - Higher effective magnitude (alpha=0.25, scale_bound=0.2)
+  - Gate floor (min 0.03) prevents full shutdown
+  - Range penalty (target gate mean in [0.03, 0.15]) instead of push-to-zero
+  - LayerNorm on stats input so edge stats can actually influence gate
+  - Small random init on final weight (1e-3) for faster warmup
+  - Larger bottleneck (feat_dim // 4, min 16)
 """
 
 import torch
@@ -17,7 +17,6 @@ from torch.autograd import Function
 
 
 class _GradReverse(Function):
-    """Gradient Reversal Layer for adversarial training."""
     @staticmethod
     def forward(ctx, x, lam):
         ctx.lam = lam
@@ -33,42 +32,49 @@ def grad_reverse(x, lam=1.0):
 
 
 class SiteCalibration(nn.Module):
-    """Sample-level residual site calibration via meta-network.
-
-    v2: constrained form, edge stats input, placed after GAT layer 1.
+    """Sample-level residual site calibration via meta-network (v3).
 
     Args:
         feat_dim: dimension of node features (= dim_hidden after GAT1)
-        gate_init_bias: initial bias for gate logit (negative = near-zero gate)
-        num_sites: number of sites for adversarial classifier (0 = disable)
-        alpha: residual scaling factor (fixed, not learned)
+        gate_init_bias: initial bias for gate logit (-1.7 => sigmoid ≈ 0.154, with floor=0.01 -> init ≈ 0.162)
+        num_sites: number of sites for adversarial classifier
+        alpha: residual scaling factor
         scale_bound: bound for tanh scaling of gamma/beta
+        gate_floor: minimum gate value after sigmoid
+        gate_range: target (min, max) for L_gate_range penalty
     """
 
-    def __init__(self, feat_dim: int, gate_init_bias: float = -3.0,
-                 num_sites: int = 0, alpha: float = 0.1, scale_bound: float = 0.1):
+    def __init__(self, feat_dim: int, gate_init_bias: float = -1.7,
+                 num_sites: int = 0, alpha: float = 0.25,
+                 scale_bound: float = 0.2, gate_floor: float = 0.01,
+                 gate_range: tuple = (0.05, 0.15)):
         super().__init__()
         self.feat_dim = feat_dim
         self.alpha = alpha
         self.scale_bound = scale_bound
+        self.gate_floor = gate_floor
+        self.gate_min, self.gate_max = gate_range
 
         # Meta-network input: 2*feat_dim (H stats) + 4 (edge stats)
-        # Edge stats: mean(|edge_weight|), std(|edge_weight|), density, positive_edge_ratio
         stat_dim = 2 * feat_dim + 4
-        bottleneck = max(feat_dim // 8, 8)
+        bottleneck = max(feat_dim // 4, 16)
+
+        # LayerNorm so edge stats have comparable magnitude to H stats
+        self.stats_norm = nn.LayerNorm(stat_dim)
+
         self.meta_net = nn.Sequential(
             nn.Linear(stat_dim, bottleneck),
             nn.ReLU(inplace=True),
-            nn.Linear(bottleneck, 3 * feat_dim),  # gamma_hat, beta_hat, gate_logit
+            nn.Linear(bottleneck, 3 * feat_dim),
         )
 
-        # Initialize: gamma_hat~0 (so gamma=1), beta_hat~0, gate near 0
+        # Small random init (not zero) for final weight; bias still identity
         with torch.no_grad():
             final = self.meta_net[-1]
-            final.weight.zero_()
-            final.bias[:feat_dim].zero_()             # gamma_hat = 0 -> gamma = 1
-            final.bias[feat_dim:2*feat_dim].zero_()   # beta_hat = 0 -> beta = 0
-            final.bias[2*feat_dim:].fill_(gate_init_bias)  # gate near 0
+            nn.init.normal_(final.weight, mean=0.0, std=1e-3)
+            final.bias[:feat_dim].zero_()             # gamma_hat = 0
+            final.bias[feat_dim:2*feat_dim].zero_()   # beta_hat = 0
+            final.bias[2*feat_dim:].fill_(gate_init_bias)
 
         # Site adversarial classifier (gradient reversal)
         if num_sites > 0:
@@ -81,14 +87,12 @@ class SiteCalibration(nn.Module):
             self.site_classifier = None
 
     def _compute_edge_stats(self, edge_weight, edge_index, batch, num_graphs, device):
-        """Compute per-graph edge statistics: mean(|w|), std(|w|), density, pos_ratio."""
+        """Per-graph edge stats: mean(|w|), std(|w|), density, pos_ratio."""
         edge_stats = torch.zeros(num_graphs, 4, device=device)
-
         if edge_weight is None or edge_weight.numel() == 0:
             return edge_stats
 
         abs_w = edge_weight.abs()
-        # Assign each edge to its source node's graph
         edge_batch = batch[edge_index[0]]
 
         for g in range(num_graphs):
@@ -98,31 +102,19 @@ class SiteCalibration(nn.Module):
             w_g = abs_w[mask]
             n_nodes = (batch == g).sum().float()
             n_edges = mask.sum().float()
-
-            edge_stats[g, 0] = w_g.mean()                           # mean(|A|)
-            edge_stats[g, 1] = w_g.std() if w_g.numel() > 1 else 0  # std(|A|)
-            max_edges = n_nodes * (n_nodes - 1)  # directed graph max
-            edge_stats[g, 2] = n_edges / max_edges.clamp(min=1)      # density
-            edge_stats[g, 3] = (edge_weight[mask] > 0).float().mean() # pos_ratio
+            edge_stats[g, 0] = w_g.mean()
+            edge_stats[g, 1] = w_g.std() if w_g.numel() > 1 else 0
+            max_edges = n_nodes * (n_nodes - 1)
+            edge_stats[g, 2] = n_edges / max_edges.clamp(min=1)
+            edge_stats[g, 3] = (edge_weight[mask] > 0).float().mean()
 
         return edge_stats
 
     def forward(self, H, batch, edge_index=None, edge_weight=None):
-        """
-        Args:
-            H: node features [N_total, feat_dim] (after GAT layer 1)
-            batch: batch indicator [N_total]
-            edge_index: [2, E] edge indices
-            edge_weight: [E] edge weights (can be None)
-
-        Returns:
-            H_calibrated: [N_total, feat_dim]
-            calib_info: dict with monitoring values
-        """
         device = H.device
         num_graphs = int(batch.max().item()) + 1
 
-        # --- Per-graph node feature statistics (stop-gradient) ---
+        # --- Per-graph node feature statistics ---
         graph_mean = torch.zeros(num_graphs, self.feat_dim, device=device)
         graph_count = torch.zeros(num_graphs, 1, device=device)
         graph_count.index_add_(0, batch, torch.ones(H.size(0), 1, device=device))
@@ -138,17 +130,18 @@ class SiteCalibration(nn.Module):
         # --- Edge statistics ---
         edge_stats = self._compute_edge_stats(edge_weight, edge_index, batch, num_graphs, device)
 
-        # --- Meta-network: [mean(H), std(H), edge_stats] -> (gamma_hat, beta_hat, gate_logit) ---
-        stats = torch.cat([graph_mean, graph_std, edge_stats], dim=1)
+        # --- LayerNorm + meta-network ---
+        stats = self.stats_norm(torch.cat([graph_mean, graph_std, edge_stats], dim=1))
         params = self.meta_net(stats)
         gamma_hat = params[:, :self.feat_dim]
         beta_hat = params[:, self.feat_dim:2*self.feat_dim]
         gate_logit = params[:, 2*self.feat_dim:]
 
         # --- Constrained parameters ---
-        gamma = 1.0 + self.scale_bound * torch.tanh(gamma_hat)  # [1-0.1, 1+0.1]
-        beta = self.scale_bound * torch.tanh(beta_hat)            # [-0.1, 0.1]
-        gate = torch.sigmoid(gate_logit)                          # [0, 1]
+        gamma = 1.0 + self.scale_bound * torch.tanh(gamma_hat)  # [1-0.2, 1+0.2]
+        beta = self.scale_bound * torch.tanh(beta_hat)            # [-0.2, 0.2]
+        # Gate with floor: min self.gate_floor
+        gate = self.gate_floor + (1 - self.gate_floor) * torch.sigmoid(gate_logit)
 
         # --- Broadcast to node level ---
         gamma_n = gamma[batch]
@@ -157,45 +150,36 @@ class SiteCalibration(nn.Module):
         mean_n = graph_mean[batch]
         std_n = graph_std[batch]
 
-        # --- Sample-internal standardization ---
+        # --- Residual calibration ---
         H_norm = (H - mean_n) / (std_n + 1e-6)
+        delta = gamma_n * H_norm + beta_n
+        H_calibrated = H + self.alpha * gate_n * (delta - H)
 
-        # --- Residual calibration: H' = H + alpha * g * (gamma * H_norm + beta - H) ---
-        H_calibrated = H + self.alpha * gate_n * (gamma_n * H_norm + beta_n - H)
-
-        # --- Monitoring values ---
-        gate_reg = gate.mean()  # L_sp = ||g||_1
-        affine_reg = (gamma - 1).pow(2).mean() + beta.pow(2).mean()  # L_aff
+        # --- Regularization values ---
+        # Range penalty: want gate_mean in [gate_min, gate_max], else linearly penalize
+        gate_mean_global = gate.mean()
+        gate_range_reg = (torch.clamp(self.gate_min - gate_mean_global, min=0)
+                         + torch.clamp(gate_mean_global - self.gate_max, min=0))
+        # L_aff still encourages identity when NOT in active use
+        affine_reg = (gamma - 1).pow(2).mean() + beta.pow(2).mean()
 
         calib_info = {
-            'gate_reg': gate_reg,
+            'gate_reg': gate_range_reg,     # now range penalty
             'affine_reg': affine_reg,
-            'gamma': gamma,        # [num_graphs, feat_dim]
+            'gamma': gamma,
             'beta': beta,
             'gate': gate,
             'gate_logit': gate_logit,
-            # Scalar monitoring values
             'gate_mean': gate.mean().item(),
             'gate_std': gate.std().item(),
-            'gamma_dev': (gamma - 1).pow(2).mean().sqrt().item(),  # ||gamma-1||
-            'beta_norm': beta.pow(2).mean().sqrt().item(),         # ||beta||
+            'gamma_dev': (gamma - 1).pow(2).mean().sqrt().item(),
+            'beta_norm': beta.pow(2).mean().sqrt().item(),
         }
 
         return H_calibrated, calib_info
 
     def gate_alignment_loss(self, gate, batch_graph, labels, env_ids):
-        """Class-conditional gate alignment across sites.
-
-        L_gate-align = sum_c sum_s ||g_bar_{s,c} - g_bar_c||^2
-
-        Same disease class across different sites should have similar gate patterns.
-
-        Args:
-            gate: [num_graphs, feat_dim] gate values
-            batch_graph: not used (gate is already per-graph)
-            labels: [num_graphs] class labels
-            env_ids: [num_graphs] site/environment IDs
-        """
+        """Class-conditional gate alignment across sites."""
         loss = torch.tensor(0.0, device=gate.device)
         classes = labels.unique()
         count = 0
@@ -204,19 +188,51 @@ class SiteCalibration(nn.Module):
             c_mask = (labels == c)
             if c_mask.sum() < 2:
                 continue
-            g_c = gate[c_mask]           # gates for class c
-            g_bar_c = g_c.mean(dim=0)    # global mean for class c
+            g_c = gate[c_mask]
+            g_bar_c = g_c.mean(dim=0)
             envs_c = env_ids[c_mask]
 
             for s in envs_c.unique():
                 s_mask = (envs_c == s)
                 if s_mask.sum() < 1:
                     continue
-                g_bar_sc = g_c[s_mask].mean(dim=0)  # mean for site s, class c
+                g_bar_sc = g_c[s_mask].mean(dim=0)
                 loss = loss + (g_bar_sc - g_bar_c).pow(2).mean()
                 count += 1
 
         return loss / max(count, 1)
+
+    @torch.no_grad()
+    def site_probe_accuracy(self, H_pre, H_post, batch, site_labels):
+        """Measure if gate is removing site info.
+
+        Returns (pre_acc, post_acc). If post_acc << pre_acc, gate is working.
+        """
+        if self.site_classifier is None:
+            return 0.0, 0.0
+
+        num_graphs = int(batch.max().item()) + 1
+        device = H_pre.device
+
+        def pool(H):
+            g = torch.zeros(num_graphs, self.feat_dim, device=device)
+            cnt = torch.zeros(num_graphs, 1, device=device)
+            cnt.index_add_(0, batch, torch.ones(H.size(0), 1, device=device))
+            g.index_add_(0, batch, H)
+            return g / cnt.clamp(min=1)
+
+        g_pre = pool(H_pre.detach())
+        g_post = pool(H_post.detach())
+
+        logits_pre = self.site_classifier(g_pre)
+        logits_post = self.site_classifier(g_post)
+
+        pred_pre = logits_pre.argmax(dim=1)
+        pred_post = logits_post.argmax(dim=1)
+
+        acc_pre = (pred_pre == site_labels.long()).float().mean().item()
+        acc_post = (pred_post == site_labels.long()).float().mean().item()
+        return acc_pre, acc_post
 
     def site_adversarial_loss(self, H_calibrated, batch, site_labels, grl_lambda=1.0):
         """Site adversarial loss on calibrated features (gradient reversal)."""

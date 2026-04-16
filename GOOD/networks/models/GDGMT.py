@@ -218,7 +218,7 @@ class GDGMT(GNNBasic):
         num_sites = max(num_sites, 20) if num_sites > 0 else 0
         self.site_calibration = SiteCalibration(
             feat_dim=config.model.dim_hidden,  # mid-level dim after GAT1
-            gate_init_bias=getattr(config.model, 'calib_gate_init', -3.0),
+            gate_init_bias=getattr(config.model, 'calib_gate_init', -1.7),
             num_sites=num_sites,
             alpha=0.1,
             scale_bound=0.1,

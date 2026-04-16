@@ -2,7 +2,7 @@ includes:
   - base.yaml
 model:
   model_name: GDGMTvGIN
-  calib_gate_init: -3.0
+  calib_gate_init: -1.7
 ood:
   ood_param: 0.0
   trade_off: 0.5
@@ -12,8 +12,8 @@ ood:
   temperature: 0.10
   variance_weight: 0.5
   covariance_weight: 0.02
-  gate_sparsity_weight: 0.01
-  affine_reg_weight: 0.01
+  gate_sparsity_weight: 0.05
+  affine_reg_weight: 0.005
   gate_cons_weight: 0.1
   site_adv_weight: 0.1
   extra_param:

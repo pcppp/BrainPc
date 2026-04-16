@@ -58,9 +58,10 @@ class Pipeline:
           - L_site: site adversarial on calibrated features
 
         Staged training:
-        Stage 1 (epoch < gate_warmup): cls + gate losses (affine_reg, gate_sparsity, gate_align)
-        Stage 2 (gate_warmup <= epoch < gbcr_warmup): + SiteAdv
-        Stage 3 (gbcr_warmup <=): freeze gate, + GBCR losses (align, entropy)
+        Stage 1 (epoch < site_adv_warmup=12): cls + gate losses
+        Stage 2 (site_adv_warmup <= epoch < gbcr_warmup=20): + SiteAdv
+        Stage 3 (gbcr_warmup <= epoch < gbcr_stop=25): freeze gate, + GBCR losses (short warm-up)
+        Stage 4 (epoch >= gbcr_stop): GBCR frozen, backbone-only finetune
         """
         data = data.to(self.config.device)
         self.ood_algorithm.optimizer.zero_grad()
@@ -83,8 +84,9 @@ class Pipeline:
 
         # --- 2. Staged auxiliary losses ---
         epoch = self.config.train.epoch
-        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 10)
+        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 12)
         gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 20)
+        gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
 
         align_val = 0.0
         entropy_val = 0.0
@@ -92,7 +94,7 @@ class Pipeline:
         gate_align_val = 0.0
 
         # --- Stage 1: gate regularization (delayed to let gate learn first) ---
-        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 10)
+        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 12)
         calib_info = self.model.calib_info
         if calib_info:
             if epoch >= gate_reg_warmup:
@@ -149,8 +151,8 @@ class Pipeline:
                             site_adv_val = site_adv_loss.item()
                             cls_loss = cls_loss + site_adv_w * site_adv_loss
 
-        # --- Stage 3 (epoch >= gbcr_warmup): freeze gate, add GBCR losses ---
-        if epoch >= gbcr_warmup and getattr(data, 'num_graphs', 1) >= 2:
+        # --- Stage 3 (gbcr_warmup <= epoch < gbcr_stop): short GBCR warm-up window ---
+        if gbcr_warmup <= epoch < gbcr_stop and getattr(data, 'num_graphs', 1) >= 2:
             # Freeze gate parameters
             for p in self.model.site_calibration.parameters():
                 p.requires_grad = False
@@ -179,10 +181,14 @@ class Pipeline:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
 
-        # Unfreeze gate after backward (so next epoch can decide again)
+        # Keep gate frozen from gbcr_warmup onward (site_calibration already static).
         if epoch >= gbcr_warmup:
             for p in self.model.site_calibration.parameters():
-                p.requires_grad = False  # keep frozen from gbcr_warmup onward
+                p.requires_grad = False
+        # Stage 4: after gbcr_stop, freeze GBCR so only backbone trains.
+        if epoch >= gbcr_stop and hasattr(self.model.gnn, 'encoder') and hasattr(self.model.gnn.encoder, 'gbcr'):
+            for p in self.model.gnn.encoder.gbcr.parameters():
+                p.requires_grad = False
 
         # Store for logging
         self.ood_algorithm.spec_loss = {
@@ -207,12 +213,12 @@ class Pipeline:
         max_epochs = self.config.train.max_epoch
         patience = getattr(self.config.train, 'patience', 15)
 
-        # --- Decision 2 & 3: MA5 scoring + local-peak top-3 checkpoints ---
+        # --- MA5 scoring + post-hoc NMS top-3 checkpoints ---
         score_history = []  # raw S_t per epoch
         top_k = 3
-        min_peak_gap = 4  # min epochs between saved peaks
-        # Each entry: (ma5_score, epoch, ckpt_path) - only local peaks
-        peak_ckpts = []
+        min_peak_gap = 4  # temporal NMS radius (in epochs)
+        # Track every saved epoch; NMS runs after training finishes.
+        all_epoch_ckpts = []  # list of (epoch, snapshot_ma5, ckpt_path)
 
         patience_counter = 0
         best_patience_score = -1.0
@@ -296,11 +302,13 @@ class Pipeline:
                   f'OOD_val {val_stat["score"]:.4f}(BA={val_stat.get("balanced_accuracy", 0):.4f}, AUC={val_stat.get("roc_auc", 0):.4f}), '
                   f'OOD_test {test_stat["score"]:.4f}(BA={test_stat.get("balanced_accuracy", 0):.4f})')
 
-            # --- Decision 2: S_t = 0.6*BA_OOD + 0.2*AUROC_OOD + 0.2*BA_ID ---
+            # --- S_t = 0.6*AUROC_OOD + 0.2*BA_OOD + 0.2*BA_ID ---
+            # AUROC is threshold-free → more stable checkpoint signal; BA comes back
+            # at test time through the post-hoc threshold search.
             ba_ood = val_stat.get('balanced_accuracy', val_stat['score']) or 0.0
             auroc_ood = val_stat.get('roc_auc', val_stat['score']) or 0.0
             ba_id = id_val_stat.get('balanced_accuracy', id_val_stat['score']) or 0.0
-            s_t = 0.6 * ba_ood + 0.2 * auroc_ood + 0.2 * ba_id
+            s_t = 0.6 * auroc_ood + 0.2 * ba_ood + 0.2 * ba_id
             score_history.append(s_t)
 
             # MA5: average of last 5 S_t values
@@ -315,38 +323,10 @@ class Pipeline:
             torch.save(ckpt, ckpt_path)
             shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
 
-            # --- Checkpoint selection: local peak with min gap ---
-            is_candidate = epoch >= 3  # skip first 3 epochs
-
-            if is_candidate:
-                # Local peak detection: S_t higher than previous 2 values
-                is_local_peak = len(score_history) >= 2 and s_t >= score_history[-2]
-                if len(score_history) >= 3:
-                    is_local_peak = is_local_peak and s_t >= score_history[-3]
-
-                # Min gap: at least 4 epochs from last saved peak
-                last_peak_epoch = peak_ckpts[-1][1] if peak_ckpts else -999
-                has_min_gap = (epoch - last_peak_epoch) >= min_peak_gap
-
-                if is_local_peak and has_min_gap:
-                    peak_ckpts.append((ma5, epoch, ckpt_path))
-                    peak_ckpts.sort(key=lambda x: x[0], reverse=True)
-                    while len(peak_ckpts) > top_k:
-                        _, _, old_path = peak_ckpts.pop()
-                        if os.path.exists(old_path) and not old_path.endswith(f'last{fold}.ckpt'):
-                            try:
-                                os.unlink(old_path)
-                            except OSError:
-                                pass
-                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} (LOCAL PEAK) peaks: {[(e, f"{s:.4f}") for s, e, _ in peak_ckpts]}')
-                else:
-                    if os.path.exists(ckpt_path) and not ckpt_path.endswith(f'last{fold}.ckpt'):
-                        try:
-                            os.unlink(ckpt_path)
-                        except OSError:
-                            pass
-                    reason = 'not peak' if not is_local_peak else f'gap={epoch - last_peak_epoch}<{min_peak_gap}'
-                    print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f} ({reason})')
+            # Record every saved epoch; NMS selection happens after the loop.
+            if epoch >= 3:
+                all_epoch_ckpts.append((epoch, ma5, ckpt_path))
+            print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f}')
 
 
             # --- Early stopping ---
@@ -360,6 +340,36 @@ class Pipeline:
                 break
 
             self.ood_algorithm.scheduler.step()
+
+        # --- Post-hoc: recompute trailing MA5 with full history, then NMS ---
+        def _trailing_ma5(i):
+            w = score_history[max(0, i - 4): i + 1]
+            return sum(w) / len(w) if w else -1.0
+
+        reranked = [(e, _trailing_ma5(e), p) for e, _m, p in all_epoch_ckpts
+                    if os.path.exists(p)]
+        reranked.sort(key=lambda x: x[1], reverse=True)
+
+        # Greedy temporal NMS: accept highest MA5, skip anything within min_peak_gap.
+        peak_ckpts = []  # (ma5, epoch, path) — format kept for compat below
+        for (e, m, p) in reranked:
+            if len(peak_ckpts) >= top_k:
+                break
+            if any(abs(e - pe) < min_peak_gap for (_, pe, _) in peak_ckpts):
+                continue
+            peak_ckpts.append((m, e, p))
+        print(f'#IN# NMS selected top-{len(peak_ckpts)} from {len(reranked)} candidates: '
+              f'{[(e, f"{m:.4f}") for m, e, _ in peak_ckpts]}')
+
+        # Delete non-selected ckpts (keep last{fold}.ckpt).
+        kept_paths = {p for _, _, p in peak_ckpts}
+        kept_paths.add(os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
+        for (_, _, p) in reranked:
+            if p not in kept_paths and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
         # --- Save top-k info for test-time ensemble ---
         topk_info_path = os.path.join(self.config.ckpt_dir, f'topk{fold}.info')
@@ -493,6 +503,7 @@ class Pipeline:
 
         all_probs = {}  # split -> list of prob arrays per checkpoint
         targets_cache = {}
+        env_cache = {}      # split -> list of env_id tensors (for pseudo-OOD threshold tuning)
         masks_cache = {}
 
         for ci, cp in enumerate(ckpt_paths):
@@ -522,6 +533,10 @@ class Pipeline:
                         if split not in targets_cache:
                             targets_cache[split] = []
                         targets_cache[split].append(data.y.cpu())
+                        if hasattr(data, 'env_id') and data.env_id is not None:
+                            if split not in env_cache:
+                                env_cache[split] = []
+                            env_cache[split].append(data.env_id.view(-1).cpu())
 
                 if split not in all_probs:
                     all_probs[split] = []
@@ -530,24 +545,58 @@ class Pipeline:
         # Average probs across checkpoints
         avg_probs_dict = {}
         targets_dict = {}
+        env_dict = {}
         for split in all_probs:
             avg_probs_dict[split] = torch.stack(all_probs[split]).mean(dim=0)  # [N, C]
             targets_dict[split] = torch.cat(targets_cache.get(split, []), dim=0).squeeze()
+            if env_cache.get(split):
+                env_dict[split] = torch.cat(env_cache[split], dim=0)
 
-        # --- Threshold tuning on OOD val: maximize balanced accuracy ---
+        # --- Threshold tuning: search in [0.35, 0.50], score = mean BA across
+        #     id_val per-site pseudo-OOD groups (fallback to OOD_val BA). ---
+        from sklearn.metrics import balanced_accuracy_score as ba_score
         best_threshold = 0.5
-        if 'val' in avg_probs_dict:
-            from sklearn.metrics import balanced_accuracy_score as ba_score
-            val_p1 = avg_probs_dict['val'][:, 1]
-            val_tgt = targets_dict['val']
-            best_ba = -1.0
-            for thr in [i * 0.05 for i in range(1, 20)]:
-                preds_thr = (val_p1 >= thr).long()
-                ba = ba_score(val_tgt.numpy(), preds_thr.numpy())
-                if ba > best_ba:
-                    best_ba = ba
+        best_score = -1.0
+        thr_grid = [0.35, 0.375, 0.40, 0.425, 0.45, 0.475, 0.50]
+
+        # Decide source: prefer id_val (multi-site pseudo-OOD); fallback to OOD val.
+        source = None
+        if ('id_val' in avg_probs_dict and 'id_val' in env_dict
+                and env_dict['id_val'].unique().numel() >= 2):
+            source = 'id_val_per_site'
+            probs_p1 = avg_probs_dict['id_val'][:, 1]
+            tgt = targets_dict['id_val']
+            envs = env_dict['id_val']
+            sites = envs.unique().tolist()
+        elif 'val' in avg_probs_dict:
+            source = 'ood_val'
+            probs_p1 = avg_probs_dict['val'][:, 1]
+            tgt = targets_dict['val']
+
+        if source is not None:
+            for thr in thr_grid:
+                preds_thr = (probs_p1 >= thr).long()
+                if source == 'id_val_per_site':
+                    per_site = []
+                    for s in sites:
+                        m = (envs == s)
+                        if m.sum() < 2:
+                            continue
+                        tgt_s = tgt[m].numpy()
+                        pred_s = preds_thr[m].numpy()
+                        if len(set(tgt_s.tolist())) < 2:
+                            continue  # single-class site → BA undefined, skip
+                        per_site.append(ba_score(tgt_s, pred_s))
+                    if not per_site:
+                        score = ba_score(tgt.numpy(), preds_thr.numpy())
+                    else:
+                        score = sum(per_site) / len(per_site)
+                else:
+                    score = ba_score(tgt.numpy(), preds_thr.numpy())
+                if score > best_score:
+                    best_score = score
                     best_threshold = thr
-            print(f'  Threshold tuned on OOD_val: {best_threshold:.2f} (BA={best_ba:.4f})')
+            print(f'  Threshold tuned on {source} (grid={thr_grid}): {best_threshold:.3f} (score={best_score:.4f})')
 
         # Compute metrics with tuned threshold
         result_ckpt = {}

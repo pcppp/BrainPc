@@ -76,6 +76,10 @@ class SiteCalibration(nn.Module):
             final.bias[feat_dim:2*feat_dim].zero_()   # beta_hat = 0
             final.bias[2*feat_dim:].fill_(gate_init_bias)
 
+        # Gate EMA buffer for alignment loss (smooths across mini-batches).
+        self._gate_ema = {}  # (class_id, site_id) -> running mean [feat_dim]
+        self._gate_ema_momentum = 0.1
+
         # Site adversarial classifier (gradient reversal)
         if num_sites > 0:
             self.site_classifier = nn.Sequential(
@@ -179,24 +183,49 @@ class SiteCalibration(nn.Module):
         return H_calibrated, calib_info
 
     def gate_alignment_loss(self, gate, batch_graph, labels, env_ids):
-        """Class-conditional gate alignment across sites."""
-        loss = torch.tensor(0.0, device=gate.device)
-        classes = labels.unique()
+        """Class-conditional gate alignment across sites (EMA-smoothed).
+
+        Maintains a running average per (class, site) across mini-batches.
+        Alignment loss pushes each site's current-batch gate toward the
+        class-wide EMA mean.  Gradients flow through current-batch gate;
+        the EMA reference is detached.
+        """
+        device = gate.device
+
+        # --- Update EMA (no grad) ---
+        with torch.no_grad():
+            for c_val in labels.unique():
+                c_mask = (labels == c_val)
+                for s_val in env_ids[c_mask].unique():
+                    sc_mask = c_mask & (env_ids == s_val)
+                    if sc_mask.sum() == 0:
+                        continue
+                    g_cs = gate[sc_mask].mean(dim=0)
+                    key = (c_val.item(), s_val.item())
+                    if key not in self._gate_ema:
+                        self._gate_ema[key] = g_cs.clone()
+                    else:
+                        m = self._gate_ema_momentum
+                        self._gate_ema[key] = (1 - m) * self._gate_ema[key] + m * g_cs
+
+        # --- Alignment loss from EMA ---
+        loss = torch.tensor(0.0, device=device)
         count = 0
-
-        for c in classes:
-            c_mask = (labels == c)
-            if c_mask.sum() < 2:
+        for c_val in labels.unique():
+            c_mask = (labels == c_val)
+            # Class-mean gate across ALL sites (from EMA buffer)
+            site_means = [(k, v) for k, v in self._gate_ema.items()
+                          if k[0] == c_val.item()]
+            if len(site_means) < 2:
                 continue
-            g_c = gate[c_mask]
-            g_bar_c = g_c.mean(dim=0)
-            envs_c = env_ids[c_mask]
+            g_bar_c = torch.stack([v for _, v in site_means]).mean(dim=0).detach()
 
-            for s in envs_c.unique():
-                s_mask = (envs_c == s)
-                if s_mask.sum() < 1:
+            # For each site in this batch: push toward class-wide mean
+            for s_val in env_ids[c_mask].unique():
+                sc_mask = c_mask & (env_ids == s_val)
+                if sc_mask.sum() == 0:
                     continue
-                g_bar_sc = g_c[s_mask].mean(dim=0)
+                g_bar_sc = gate[sc_mask].mean(dim=0)  # has gradient
                 loss = loss + (g_bar_sc - g_bar_c).pow(2).mean()
                 count += 1
 

@@ -57,11 +57,12 @@ class Pipeline:
           - L_entropy: assignment entropy (balanced balls)
           - L_site: site adversarial on calibrated features
 
-        Staged training:
-        Stage 1 (epoch < site_adv_warmup=12): cls + gate losses
-        Stage 2 (site_adv_warmup <= epoch < gbcr_warmup=20): + SiteAdv
-        Stage 3 (gbcr_warmup <= epoch < gbcr_stop=25): freeze gate, + GBCR losses (short warm-up)
-        Stage 4 (epoch >= gbcr_stop): GBCR frozen, backbone-only finetune
+        Staged training (max_epoch=35, early_stop from epoch 25):
+        Stage 1 (epoch < 8):   cls + gate losses (SiteCalibration learns freely)
+        Stage 2 (8 <= epoch < 20): + SiteAdv (weight=0.05)
+        Stage 3 (18 <= epoch < 25): + GBCR (7 epochs of training)
+        Stage 4 (epoch >= 25):  all aux frozen, backbone-only finetune
+        Early stopping only allowed from epoch 25+; ckpt candidates from epoch 10+.
         """
         data = data.to(self.config.device)
         self.ood_algorithm.optimizer.zero_grad()
@@ -84,8 +85,9 @@ class Pipeline:
 
         # --- 2. Staged auxiliary losses ---
         epoch = self.config.train.epoch
-        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 12)
-        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 20)
+        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 8)
+        site_adv_stop = getattr(self.config.train, 'site_adv_stop_epoch', 20)
+        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 18)
         gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
 
         align_val = 0.0
@@ -94,7 +96,7 @@ class Pipeline:
         gate_align_val = 0.0
 
         # --- Stage 1: gate regularization (delayed to let gate learn first) ---
-        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 12)
+        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 8)
         calib_info = self.model.calib_info
         if calib_info:
             if epoch >= gate_reg_warmup:
@@ -105,29 +107,25 @@ class Pipeline:
                 affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.005) * ramp
                 cls_loss = cls_loss + affine_w * calib_info['affine_reg']
 
-                # L_gate-range: penalize if gate mean outside [0.03, 0.15]
+                # L_gate-range: penalize if gate mean outside [0.05, 0.15]
                 gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.05) * ramp
                 cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
 
-            # L_gate-align: class-conditional gate alignment across sites
-            # Use graph-level labels (data.y may be [num_graphs] or [num_graphs,1])
-            if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
-                gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.05)
-                # Ensure labels and env_ids are graph-level, matching gate shape
-                y_graph = data.y.view(-1)
-                env_graph = data.env_id.view(-1)
-                num_graphs = calib_info['gate'].size(0)
-                # data.y for graph tasks: [num_graphs] or [num_graphs, 1]
-                # data.env_id: [num_graphs]
-                if y_graph.size(0) == num_graphs and env_graph.size(0) == num_graphs:
-                    gate_align_loss = self.model.site_calibration.gate_alignment_loss(
-                        calib_info['gate'], None, y_graph, env_graph)
-                    gate_align_val = gate_align_loss.item()
-                    cls_loss = cls_loss + gate_align_w * gate_align_loss
+                # L_gate-align: EMA-smoothed alignment, also warmed up
+                if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
+                    gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.1) * ramp
+                    y_graph = data.y.view(-1)
+                    env_graph = data.env_id.view(-1)
+                    num_graphs = calib_info['gate'].size(0)
+                    if y_graph.size(0) == num_graphs and env_graph.size(0) == num_graphs:
+                        gate_align_loss = self.model.site_calibration.gate_alignment_loss(
+                            calib_info['gate'], None, y_graph, env_graph)
+                        gate_align_val = gate_align_loss.item()
+                        cls_loss = cls_loss + gate_align_w * gate_align_loss
 
-        # --- Stage 2 (epoch >= site_adv_warmup): add SiteAdv ---
-        if epoch >= site_adv_warmup and getattr(data, 'num_graphs', 1) >= 2:
-            site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.1)
+        # --- Stage 2 (site_adv_warmup <= epoch < site_adv_stop): SiteAdv ---
+        if site_adv_warmup <= epoch < site_adv_stop and getattr(data, 'num_graphs', 1) >= 2:
+            site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.05)
             if site_adv_w > 0 and self.model.site_calibration.site_classifier is not None:
                 if hasattr(data, 'env_id') and data.env_id is not None:
                     # Use calibrated features from encoder (already computed in forward)
@@ -211,7 +209,7 @@ class Pipeline:
         self.model.set_mode('finetune')
 
         max_epochs = self.config.train.max_epoch
-        patience = getattr(self.config.train, 'patience', 15)
+        patience = getattr(self.config.train, 'patience', 8)
 
         # --- MA5 scoring + post-hoc NMS top-3 checkpoints ---
         score_history = []  # raw S_t per epoch
@@ -302,13 +300,15 @@ class Pipeline:
                   f'OOD_val {val_stat["score"]:.4f}(BA={val_stat.get("balanced_accuracy", 0):.4f}, AUC={val_stat.get("roc_auc", 0):.4f}), '
                   f'OOD_test {test_stat["score"]:.4f}(BA={test_stat.get("balanced_accuracy", 0):.4f})')
 
-            # --- S_t = 0.6*AUROC_OOD + 0.2*BA_OOD + 0.2*BA_ID ---
-            # AUROC is threshold-free → more stable checkpoint signal; BA comes back
-            # at test time through the post-hoc threshold search.
+            # --- S_t with train-test gap penalty ---
+            # Penalise source-overfit: if train BA >> val BA, downweight this epoch.
             ba_ood = val_stat.get('balanced_accuracy', val_stat['score']) or 0.0
             auroc_ood = val_stat.get('roc_auc', val_stat['score']) or 0.0
             ba_id = id_val_stat.get('balanced_accuracy', id_val_stat['score']) or 0.0
-            s_t = 0.6 * auroc_ood + 0.2 * ba_ood + 0.2 * ba_id
+            ba_train = epoch_train_stat.get('balanced_accuracy', epoch_train_stat['score']) or 0.0
+            ba_val_mix = 0.5 * ba_ood + 0.5 * ba_id
+            gap_penalty = max(0.0, ba_train - ba_val_mix)
+            s_t = 0.5 * auroc_ood + 0.2 * ba_ood + 0.2 * ba_id - 0.1 * gap_penalty
             score_history.append(s_t)
 
             # MA5: average of last 5 S_t values
@@ -323,21 +323,31 @@ class Pipeline:
             torch.save(ckpt, ckpt_path)
             shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
 
-            # Record every saved epoch; NMS selection happens after the loop.
-            if epoch >= 3:
+            # Record candidates for final ensemble (only mature epochs).
+            # Epoch < 10 checkpoints are saved to disk for analysis but excluded
+            # from the final NMS/ensemble — they are pure stage-1 and would
+            # dominate over later, better-generalizing checkpoints.
+            ckpt_min_epoch = getattr(self.config.train, 'ckpt_min_epoch', 10)
+            if epoch >= ckpt_min_epoch:
                 all_epoch_ckpts.append((epoch, ma5, ckpt_path))
             print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f}')
 
 
-            # --- Early stopping ---
-            if ma5 > best_patience_score:
-                best_patience_score = ma5
-                patience_counter = 0
+            # --- Early stopping (only after all stages have had time to train) ---
+            early_stop_start = getattr(self.config.train, 'early_stop_start_epoch', 25)
+            if epoch >= early_stop_start:
+                if ma5 > best_patience_score:
+                    best_patience_score = ma5
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'#IN# Early stopping at epoch {epoch} (best MA5: {best_patience_score:.4f})')
+                    break
             else:
-                patience_counter += 1
-            if patience_counter >= patience:
-                print(f'#IN# Early stopping at epoch {epoch} (best MA5: {best_patience_score:.4f})')
-                break
+                # Before early_stop_start: still track best score but never stop
+                if ma5 > best_patience_score:
+                    best_patience_score = ma5
 
             self.ood_algorithm.scheduler.step()
 
@@ -351,13 +361,22 @@ class Pipeline:
         reranked.sort(key=lambda x: x[1], reverse=True)
 
         # Greedy temporal NMS: accept highest MA5, skip anything within min_peak_gap.
-        peak_ckpts = []  # (ma5, epoch, path) — format kept for compat below
-        for (e, m, p) in reranked:
-            if len(peak_ckpts) >= top_k:
-                break
-            if any(abs(e - pe) < min_peak_gap for (_, pe, _) in peak_ckpts):
-                continue
-            peak_ckpts.append((m, e, p))
+        # If fewer than top_k selected, relax gap from 4 → 3 and retry.
+        def _nms(candidates, gap, k):
+            selected = []
+            for (e, m, p) in candidates:
+                if len(selected) >= k:
+                    break
+                if any(abs(e - pe) < gap for (_, pe, _) in selected):
+                    continue
+                selected.append((m, e, p))
+            return selected
+
+        peak_ckpts = _nms(reranked, min_peak_gap, top_k)
+        if len(peak_ckpts) < top_k and min_peak_gap > 3:
+            peak_ckpts = _nms(reranked, 3, top_k)
+            if len(peak_ckpts) > len(_nms(reranked, min_peak_gap, top_k)):
+                print(f'#IN#  NMS relaxed gap {min_peak_gap}→3 to get {len(peak_ckpts)} checkpoints')
         print(f'#IN# NMS selected top-{len(peak_ckpts)} from {len(reranked)} candidates: '
               f'{[(e, f"{m:.4f}") for m, e, _ in peak_ckpts]}')
 
@@ -373,10 +392,11 @@ class Pipeline:
 
         # --- Save top-k info for test-time ensemble ---
         topk_info_path = os.path.join(self.config.ckpt_dir, f'topk{fold}.info')
-        topk_paths = [p for _, _, p in peak_ckpts if os.path.exists(p)]
         with open(topk_info_path, 'w') as f:
-            for p in topk_paths:
-                f.write(p + '\n')
+            for m, e, p in peak_ckpts:
+                if os.path.exists(p):
+                    f.write(f'{p}\t{m:.6f}\n')
+        topk_paths = [p for _, _, p in peak_ckpts if os.path.exists(p)]
         print(f'#IN# Saved top-{len(topk_paths)} peak checkpoints for ensemble.')
 
         # --- Save best{fold}.ckpt and id_best{fold}.ckpt for backward compat ---
@@ -481,14 +501,19 @@ class Pipeline:
             # Decision 3: ensemble top-k checkpoints
             topk_info_path = os.path.join(self.config.ckpt_dir, f'topk{fold}.info')
             if os.path.exists(topk_info_path):
+                ckpt_paths = []
+                ckpt_ma5s = []
                 with open(topk_info_path) as f:
-                    ckpt_paths = [l.strip() for l in f if l.strip() and os.path.exists(l.strip())]
+                    for l in f:
+                        parts = l.strip().split('\t')
+                        if not parts[0] or not os.path.exists(parts[0]):
+                            continue
+                        ckpt_paths.append(parts[0])
+                        ckpt_ma5s.append(float(parts[1]) if len(parts) > 1 else 1.0)
                 if ckpt_paths:
                     print(f'#IN# Ensemble evaluation with {len(ckpt_paths)} checkpoints')
-                    ensemble_ckpt = self._ensemble_evaluate(ckpt_paths, fold)
-                    # Also load single best for backward compat
-                    best_ckpt_path = ckpt_paths[0]  # highest MA3
-                    single_ckpt = torch.load(best_ckpt_path, map_location=self.config.device)
+                    ensemble_ckpt, single_ckpt = self._ensemble_evaluate(
+                        ckpt_paths, ckpt_ma5s, fold)
                     return ensemble_ckpt, single_ckpt
 
             # Fallback to old behavior
@@ -497,8 +522,8 @@ class Pipeline:
             return in_ckpt, ckpt
 
     @torch.no_grad()
-    def _ensemble_evaluate(self, ckpt_paths, fold):
-        """Ensemble top-k checkpoints: average softmax probabilities, then predict."""
+    def _ensemble_evaluate(self, ckpt_paths, ma5_scores, fold):
+        """Ensemble top-k checkpoints: MA5-weighted softmax probabilities."""
         from GOOD.utils.evaluation import eval_data_preprocess, eval_score
 
         all_probs = {}  # split -> list of prob arrays per checkpoint
@@ -542,61 +567,56 @@ class Pipeline:
                     all_probs[split] = []
                 all_probs[split].append(torch.cat(preds_this, dim=0))
 
-        # Average probs across checkpoints
+        # MA5-weighted softmax average (τ=5) across checkpoints
+        tau = getattr(self.config.ood, 'ensemble_tau', 5.0)
+        ma5_t = torch.tensor(ma5_scores, dtype=torch.float)
+        ens_weights = torch.softmax(tau * ma5_t, dim=0)
+        print(f'  Ensemble weights (τ={tau}): {[f"{w:.3f}" for w in ens_weights.tolist()]}')
+
         avg_probs_dict = {}
         targets_dict = {}
         env_dict = {}
         for split in all_probs:
-            avg_probs_dict[split] = torch.stack(all_probs[split]).mean(dim=0)  # [N, C]
+            prob_stack = torch.stack(all_probs[split])  # [K, N, C]
+            avg_probs_dict[split] = (prob_stack * ens_weights.view(-1, 1, 1)).sum(dim=0)
             targets_dict[split] = torch.cat(targets_cache.get(split, []), dim=0).squeeze()
             if env_cache.get(split):
                 env_dict[split] = torch.cat(env_cache[split], dim=0)
 
-        # --- Threshold tuning: search in [0.35, 0.50], score = mean BA across
-        #     id_val per-site pseudo-OOD groups (fallback to OOD_val BA). ---
+        # --- Disagreement check: if top-k predictions diverge, fall back to single ---
+        use_single = False
+        if len(ckpt_paths) > 1 and 'val' in all_probs:
+            prob_stack_val = torch.stack(all_probs['val'])  # [K, N, C]
+            D = prob_stack_val[:, :, 1].var(dim=0).mean().item()
+            if D > 0.02:
+                print(f'  Disagreement D={D:.4f} > 0.02 → falling back to single-best probs')
+                use_single = True
+                for split in avg_probs_dict:
+                    avg_probs_dict[split] = all_probs[split][0]  # highest MA5
+            else:
+                print(f'  Disagreement D={D:.4f} <= 0.02 → using ensemble')
+
+        # --- Threshold tuning: blend 0.5*BA_OOD_val + 0.5*BA_ID_val ---
         from sklearn.metrics import balanced_accuracy_score as ba_score
         best_threshold = 0.5
         best_score = -1.0
-        thr_grid = [0.35, 0.375, 0.40, 0.425, 0.45, 0.475, 0.50]
+        thr_grid = [0.40, 0.45, 0.50]
 
-        # Decide source: prefer id_val (multi-site pseudo-OOD); fallback to OOD val.
-        source = None
-        if ('id_val' in avg_probs_dict and 'id_val' in env_dict
-                and env_dict['id_val'].unique().numel() >= 2):
-            source = 'id_val_per_site'
-            probs_p1 = avg_probs_dict['id_val'][:, 1]
-            tgt = targets_dict['id_val']
-            envs = env_dict['id_val']
-            sites = envs.unique().tolist()
-        elif 'val' in avg_probs_dict:
-            source = 'ood_val'
-            probs_p1 = avg_probs_dict['val'][:, 1]
-            tgt = targets_dict['val']
-
-        if source is not None:
-            for thr in thr_grid:
-                preds_thr = (probs_p1 >= thr).long()
-                if source == 'id_val_per_site':
-                    per_site = []
-                    for s in sites:
-                        m = (envs == s)
-                        if m.sum() < 2:
-                            continue
-                        tgt_s = tgt[m].numpy()
-                        pred_s = preds_thr[m].numpy()
-                        if len(set(tgt_s.tolist())) < 2:
-                            continue  # single-class site → BA undefined, skip
-                        per_site.append(ba_score(tgt_s, pred_s))
-                    if not per_site:
-                        score = ba_score(tgt.numpy(), preds_thr.numpy())
-                    else:
-                        score = sum(per_site) / len(per_site)
-                else:
-                    score = ba_score(tgt.numpy(), preds_thr.numpy())
+        for thr in thr_grid:
+            ba_sources = []
+            for src in ['val', 'id_val']:  # OOD_val + ID_val
+                if src not in avg_probs_dict:
+                    continue
+                p1 = avg_probs_dict[src][:, 1]
+                tg = targets_dict[src]
+                pr = (p1 >= thr).long()
+                ba_sources.append(ba_score(tg.numpy(), pr.numpy()))
+            if ba_sources:
+                score = sum(ba_sources) / len(ba_sources)
                 if score > best_score:
                     best_score = score
                     best_threshold = thr
-            print(f'  Threshold tuned on {source} (grid={thr_grid}): {best_threshold:.3f} (score={best_score:.4f})')
+        print(f'  Threshold (0.5*BA_OOD + 0.5*BA_ID): {best_threshold:.3f} (score={best_score:.4f})')
 
         # Compute metrics with tuned threshold
         result_ckpt = {}
@@ -642,7 +662,47 @@ class Pipeline:
         result_ckpt['ood_val_subject_num'] = len(targets_dict.get('val', []))
         result_ckpt['ood_test_subject_num'] = len(targets_dict.get('test', []))
 
-        return result_ckpt
+        # --- Single-best evaluation (same tuned threshold) ---
+        single_result = {}
+        for split in avg_probs_dict:
+            single_probs = all_probs[split][0]  # first = highest MA5
+            targets = targets_dict[split]
+            prob_class1 = single_probs[:, 1]
+            preds = (prob_class1 >= best_threshold).long()
+            acc = (preds == targets).float().mean().item()
+            ba = ba_score(targets.numpy(), preds.numpy())
+            prec = precision_score(targets.numpy(), preds.numpy(), zero_division=0)
+            rec = recall_score(targets.numpy(), preds.numpy(), zero_division=0)
+            f1_val = f1_score(targets.numpy(), preds.numpy(), zero_division=0)
+            try:
+                auroc = sk_auroc(targets.numpy(), prob_class1.numpy())
+            except ValueError:
+                auroc = 0.5
+
+            prefix = {'eval_train': 'train', 'id_val': 'id_val', 'id_test': 'id_test',
+                       'val': 'ood_val', 'test': 'ood_test'}.get(split, split)
+            single_result[f'{prefix}_score'] = acc
+            single_result[f'{prefix}_balanced_accuracy'] = ba
+            single_result[f'{prefix}_roc_auc'] = auroc
+            single_result[f'{prefix}_precision'] = prec
+            single_result[f'{prefix}_recall'] = rec
+            single_result[f'{prefix}_f1'] = f1_val
+            print(f'  Single  {split}: acc={acc:.4f}, BA={ba:.4f}, AUROC={auroc:.4f}')
+
+        # Backward compat fields for single_result
+        single_result['epoch'] = 'single_best'
+        single_result['train_score'] = single_result.get('train_score', 0)
+        single_result['train_loss'] = torch.tensor(0.0)
+        for key in ['id_val_loss', 'id_test_loss', 'ood_val_loss', 'ood_test_loss']:
+            single_result[key] = torch.tensor(0.0)
+        single_result['val_score'] = single_result.get('ood_val_score', 0)
+        single_result['test_score'] = single_result.get('ood_test_score', 0)
+        single_result['id_val_subject_num'] = len(targets_dict.get('id_val', []))
+        single_result['id_test_subject_num'] = len(targets_dict.get('id_test', []))
+        single_result['ood_val_subject_num'] = len(targets_dict.get('val', []))
+        single_result['ood_test_subject_num'] = len(targets_dict.get('test', []))
+
+        return result_ckpt, single_result
 
     def config_model(self, mode: str, load_param=False, fold=0):
         r"""

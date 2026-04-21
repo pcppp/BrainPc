@@ -22,13 +22,13 @@ ood:
     - 0.7
     - 3
 train:
-  max_epoch: 100
+  max_epoch: 35
   lr: 1e-3
   weight_decay: 1e-3
   ball_r: 0.5
   gb_weight: 0.02
   label_smoothing: 0.05
-  patience: 20
+  patience: 8
   classifier_dropout: 0.5
   # Staged training: epoch thresholds
   gate_warmup_epoch: 10

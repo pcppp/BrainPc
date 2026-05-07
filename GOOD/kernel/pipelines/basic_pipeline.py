@@ -352,12 +352,6 @@ class Pipeline:
                             if loss_name not in spec_loss:
                                 spec_loss[loss_name] = 0
                             spec_loss[loss_name] = (spec_loss[loss_name] * index + loss_value) / (index + 1)
-                if episode_log is not None:
-                    print(f"#IN# [MetaEpisode] meta_test_site={episode_log['meta_test_site']} "
-                          f"meta_train_sites={episode_log['meta_train_sites']} "
-                          f"loss_meta_train={episode_log['loss_meta_train']:.4f} "
-                          f"loss_meta_test={episode_log['loss_meta_test']:.4f} "
-                          f"loss_total={float(episode_log['loss'].item()):.4f}")
             else:
                 training_mode = 'standard'
                 for index, data in enumerate(self.loader['train']):
@@ -378,25 +372,52 @@ class Pipeline:
                                     spec_loss[loss_name] = 0
                                 spec_loss[loss_name] = (spec_loss[loss_name] * index + loss_value) / (index + 1)
 
-            # Print training loss
-            if self.ood_algorithm.spec_loss is not None and isinstance(spec_loss, dict):
-                desc = f'ML: {mean_loss:.4f}|'
-                for ln, lv in spec_loss.items():
-                    desc += f'{ln}: {lv:.4f}|'
-                print(f'#IN#Epoch {epoch}: {desc[:-1]}')
+            # ----- Evaluate on all five splits -----
+            epoch_train_stat = self.evaluate('eval_train')
+            id_val_stat = self.evaluate('id_val', True)
+            id_test_stat = self.evaluate('id_test', True)
+            val_stat = self.evaluate('val', True)
+            test_stat = self.evaluate('test', True)
 
-            # Gate monitoring
-            gate_info = self.model.calib_info if hasattr(self.model, 'calib_info') and self.model.calib_info else {}
-            if gate_info:
-                print(f'#IN#  Gate: mean={gate_info.get("gate_mean",0):.4f} '
-                      f'std={gate_info.get("gate_std",0):.4f} '
-                      f'||\u03b3-1||={gate_info.get("gamma_dev",0):.4f} '
-                      f'||\u03b2||={gate_info.get("beta_norm",0):.4f}')
+            # ----- Compute S_t and MA5 -----
+            ba_ood = val_stat.get('balanced_accuracy', val_stat['score']) or 0.0
+            auroc_ood = val_stat.get('roc_auc', val_stat['score']) or 0.0
+            ba_id = id_val_stat.get('balanced_accuracy', id_val_stat['score']) or 0.0
+            ba_train = epoch_train_stat.get('balanced_accuracy', epoch_train_stat['score']) or 0.0
+            ba_val_mix = 0.5 * ba_ood + 0.5 * ba_id
+            gap_penalty = max(0.0, ba_train - ba_val_mix)
+            s_t = 0.5 * auroc_ood + 0.2 * ba_ood + 0.2 * ba_id - 0.1 * gap_penalty
+            score_history.append(s_t)
+            ma5 = sum(score_history[-5:]) / min(len(score_history), 5)
 
-            # Site probe: pre-gate vs post-gate site classification accuracy.
-            # IMPORTANT: use last_trained_data — it is the exact batch whose forward
-            # produced encoder._h_pre_gate / _h_calibrated. Re-iterating the loader
-            # would misalign batch/env_id against the cached representations.
+            # ----- Save checkpoint (always, for post-hoc top-k NMS) -----
+            ckpt = self._build_ckpt(epoch, epoch_train_stat, id_val_stat, id_test_stat, val_stat, test_stat)
+            if not os.path.exists(self.config.ckpt_dir):
+                os.makedirs(self.config.ckpt_dir)
+            ckpt_path = os.path.join(self.config.ckpt_dir, f'{epoch}.ckpt')
+            torch.save(ckpt, ckpt_path)
+            shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
+            ckpt_min_epoch = getattr(self.config.train, 'ckpt_min_epoch', 10)
+            if epoch >= ckpt_min_epoch:
+                all_epoch_ckpts.append((epoch, ma5, ckpt_path))
+
+            # ----- Early stopping bookkeeping (decision printed below) -----
+            early_stop_start = getattr(self.config.train, 'early_stop_start_epoch', 25)
+            should_stop = False
+            if epoch >= early_stop_start:
+                if ma5 > best_patience_score:
+                    best_patience_score = ma5
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if patience_counter >= patience:
+                    should_stop = True
+            else:
+                if ma5 > best_patience_score:
+                    best_patience_score = ma5
+
+            # ----- SiteProbe (only available in standard mode) -----
+            site_probe_line = None
             encoder = self.model.gnn.encoder if hasattr(self.model.gnn, 'encoder') else None
             if (encoder is not None and hasattr(encoder, '_h_pre_gate')
                     and encoder._h_pre_gate is not None and encoder._h_calibrated is not None
@@ -407,78 +428,74 @@ class Pipeline:
                 try:
                     probe_batch = last_trained_data.batch.to(self.config.device)
                     probe_env = last_trained_data.env_id.view(-1).to(self.config.device)
-                    # Sanity check: pooled graph count must match env_id count
                     n_graphs_feat = int(probe_batch.max().item()) + 1
                     if n_graphs_feat != probe_env.size(0):
-                        print(f'#WARN# SiteProbe skipped: n_graphs({n_graphs_feat}) != env_id({probe_env.size(0)})')
+                        site_probe_line = f'skipped (n_graphs={n_graphs_feat} != env_id={probe_env.size(0)})'
                     else:
                         pre_acc, post_acc = self.model.site_calibration.site_probe_accuracy(
                             encoder._h_pre_gate, encoder._h_calibrated,
                             probe_batch, probe_env)
-                        print(f'#IN#  SiteProbe: pre={pre_acc:.4f} post={post_acc:.4f}')
-                except Exception as e:
-                    print(f'#WARN# SiteProbe failed: {type(e).__name__}: {e}')
+                        site_probe_line = (f'pre={pre_acc:.4f}  post={post_acc:.4f}  '
+                                           f'Δ={pre_acc - post_acc:+.4f}')
+                except Exception as exc:
+                    site_probe_line = f'failed: {type(exc).__name__}: {exc}'
 
-            # Evaluate
-            epoch_train_stat = self.evaluate('eval_train')
-            id_val_stat = self.evaluate('id_val', True)
-            id_test_stat = self.evaluate('id_test', True)
-            val_stat = self.evaluate('val', True)
-            test_stat = self.evaluate('test', True)
-            print(f'#IN#Epoch {epoch}: Train {epoch_train_stat["score"]:.4f}, '
-                  f'ID_val {id_val_stat["score"]:.4f}(BA={id_val_stat.get("balanced_accuracy", 0):.4f}), '
-                  f'ID_test {id_test_stat["score"]:.4f}, '
-                  f'OOD_val {val_stat["score"]:.4f}(BA={val_stat.get("balanced_accuracy", 0):.4f}, AUC={val_stat.get("roc_auc", 0):.4f}), '
-                  f'OOD_test {test_stat["score"]:.4f}(BA={test_stat.get("balanced_accuracy", 0):.4f})')
+            # ===================== Consolidated epoch report =====================
+            sep = '=' * 88
+            sub = '-' * 88
+            alpha_val = self.config.train.alpha
+            print(f'\n{sep}')
+            print(f'  Epoch {epoch:02d} / {max_epochs:02d}   |   mode = {training_mode}   |   alpha = {alpha_val:.4f}')
+            print(sep)
 
-            # --- S_t with train-test gap penalty ---
-            # Penalise source-overfit: if train BA >> val BA, downweight this epoch.
-            ba_ood = val_stat.get('balanced_accuracy', val_stat['score']) or 0.0
-            auroc_ood = val_stat.get('roc_auc', val_stat['score']) or 0.0
-            ba_id = id_val_stat.get('balanced_accuracy', id_val_stat['score']) or 0.0
-            ba_train = epoch_train_stat.get('balanced_accuracy', epoch_train_stat['score']) or 0.0
-            ba_val_mix = 0.5 * ba_ood + 0.5 * ba_id
-            gap_penalty = max(0.0, ba_train - ba_val_mix)
-            s_t = 0.5 * auroc_ood + 0.2 * ba_ood + 0.2 * ba_id - 0.1 * gap_penalty
-            score_history.append(s_t)
+            # Train losses
+            print(f'  Train      total = {mean_loss:.4f}')
+            if isinstance(spec_loss, dict) and len(spec_loss) > 0:
+                spec_items = '   '.join(f'{k}={v:.4f}' for k, v in spec_loss.items())
+                print(f'             {spec_items}')
+            if episode_log is not None:
+                print(f'             meta_train = {episode_log["loss_meta_train"]:.4f}   '
+                      f'meta_test = {episode_log["loss_meta_test"]:.4f}')
+                print(f'             meta_test_site = {episode_log["meta_test_site"]}   '
+                      f'meta_train_sites = {episode_log["meta_train_sites"]}')
 
-            # MA5: average of last 5 S_t values
-            window = score_history[-5:]
-            ma5 = sum(window) / len(window)
+            # Gate / SiteProbe
+            gate_info = self.model.calib_info if hasattr(self.model, 'calib_info') and self.model.calib_info else {}
+            if gate_info or site_probe_line is not None:
+                print(sub)
+            if gate_info:
+                print(f'  Gate       mean = {gate_info.get("gate_mean", 0):.4f}   '
+                      f'std = {gate_info.get("gate_std", 0):.4f}   '
+                      f'||γ-1|| = {gate_info.get("gamma_dev", 0):.4f}   '
+                      f'||β|| = {gate_info.get("beta_norm", 0):.4f}')
+            if site_probe_line is not None:
+                print(f'  SiteProbe  {site_probe_line}')
 
-            # --- Save checkpoint (always save for top-k tracking) ---
-            ckpt = self._build_ckpt(epoch, epoch_train_stat, id_val_stat, id_test_stat, val_stat, test_stat)
-            if not os.path.exists(self.config.ckpt_dir):
-                os.makedirs(self.config.ckpt_dir)
-            ckpt_path = os.path.join(self.config.ckpt_dir, f'{epoch}.ckpt')
-            torch.save(ckpt, ckpt_path)
-            shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
+            # Eval
+            print(sub)
+            print(f'  Eval       Train     score = {epoch_train_stat["score"]:.4f}')
+            print(f'             ID_val    score = {id_val_stat["score"]:.4f}   '
+                  f'BA = {id_val_stat.get("balanced_accuracy", 0):.4f}')
+            print(f'             ID_test   score = {id_test_stat["score"]:.4f}   '
+                  f'BA = {id_test_stat.get("balanced_accuracy", 0):.4f}')
+            print(f'             OOD_val   score = {val_stat["score"]:.4f}   '
+                  f'BA = {val_stat.get("balanced_accuracy", 0):.4f}   '
+                  f'AUROC = {val_stat.get("roc_auc", 0):.4f}')
+            print(f'             OOD_test  score = {test_stat["score"]:.4f}   '
+                  f'BA = {test_stat.get("balanced_accuracy", 0):.4f}')
 
-            # Record candidates for final ensemble (only mature epochs).
-            # Epoch < 10 checkpoints are saved to disk for analysis but excluded
-            # from the final NMS/ensemble — they are pure stage-1 and would
-            # dominate over later, better-generalizing checkpoints.
-            ckpt_min_epoch = getattr(self.config.train, 'ckpt_min_epoch', 10)
-            if epoch >= ckpt_min_epoch:
-                all_epoch_ckpts.append((epoch, ma5, ckpt_path))
-            print(f'#IN#  MA5={ma5:.4f} S_t={s_t:.4f}')
+            # Score
+            print(sub)
+            patience_str = (f'   patience = {patience_counter}/{patience}'
+                            if epoch >= early_stop_start else '')
+            print(f'  Score      S_t = {s_t:.4f}   MA5 = {ma5:.4f}   '
+                  f'best_MA5 = {best_patience_score:.4f}{patience_str}')
+            print(sep)
 
-
-            # --- Early stopping (only after all stages have had time to train) ---
-            early_stop_start = getattr(self.config.train, 'early_stop_start_epoch', 25)
-            if epoch >= early_stop_start:
-                if ma5 > best_patience_score:
-                    best_patience_score = ma5
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                if patience_counter >= patience:
-                    print(f'#IN# Early stopping at epoch {epoch} (best MA5: {best_patience_score:.4f})')
-                    break
-            else:
-                # Before early_stop_start: still track best score but never stop
-                if ma5 > best_patience_score:
-                    best_patience_score = ma5
+            if should_stop:
+                print(f'\n  ⏹  EARLY STOP at epoch {epoch}   (best MA5: {best_patience_score:.4f})')
+                print(sep + '\n')
+                break
 
             self.ood_algorithm.scheduler.step()
 

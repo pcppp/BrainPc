@@ -91,27 +91,54 @@ class SiteCalibration(nn.Module):
             self.site_classifier = None
 
     def _compute_edge_stats(self, edge_weight, edge_index, batch, num_graphs, device):
-        """Per-graph edge stats: mean(|w|), std(|w|), density, pos_ratio."""
+        """Per-graph edge stats: mean(|w|), std(|w|), density, pos_ratio.
+
+        Vectorised via scatter_add_ — one pass over all edges instead of
+        num_graphs Python iterations. Std uses the population (biased)
+        estimator sqrt(E[w^2] - E[w]^2) so a single-edge graph yields 0
+        without the unbiased NaN edge case.
+        """
         edge_stats = torch.zeros(num_graphs, 4, device=device)
         if edge_weight is None or edge_weight.numel() == 0:
             return edge_stats
 
-        abs_w = edge_weight.abs()
-        edge_batch = batch[edge_index[0]]
+        # Normalise shapes: edge_weight may be [E] or [E, 1].
+        w = edge_weight.view(-1).float()
+        abs_w = w.abs()
+        edge_batch = batch[edge_index[0]]            # [E] graph id per edge
 
-        for g in range(num_graphs):
-            mask = (edge_batch == g)
-            if mask.sum() == 0:
-                continue
-            w_g = abs_w[mask]
-            n_nodes = (batch == g).sum().float()
-            n_edges = mask.sum().float()
-            edge_stats[g, 0] = w_g.mean()
-            edge_stats[g, 1] = w_g.std() if w_g.numel() > 1 else 0
-            max_edges = n_nodes * (n_nodes - 1)
-            edge_stats[g, 2] = n_edges / max_edges.clamp(min=1)
-            edge_stats[g, 3] = (edge_weight[mask] > 0).float().mean()
+        # --- Per-graph counters ---
+        edge_count = torch.zeros(num_graphs, device=device)
+        edge_count.scatter_add_(0, edge_batch, torch.ones_like(abs_w))
 
+        node_count = torch.zeros(num_graphs, device=device)
+        node_count.scatter_add_(0, batch, torch.ones(batch.size(0), device=device))
+
+        # --- mean(|w|) and E[w^2] for population std ---
+        sum_abs = torch.zeros(num_graphs, device=device)
+        sum_abs.scatter_add_(0, edge_batch, abs_w)
+        mean_abs = sum_abs / edge_count.clamp(min=1)
+
+        sum_sq = torch.zeros(num_graphs, device=device)
+        sum_sq.scatter_add_(0, edge_batch, abs_w.pow(2))
+        var = (sum_sq / edge_count.clamp(min=1)) - mean_abs.pow(2)
+        std_abs = var.clamp(min=0).sqrt()
+
+        # --- Density = E_g / (N_g * (N_g - 1)) ---
+        max_edges = node_count * (node_count - 1)
+        density = edge_count / max_edges.clamp(min=1)
+
+        # --- Positive-edge ratio ---
+        pos_sum = torch.zeros(num_graphs, device=device)
+        pos_sum.scatter_add_(0, edge_batch, (w > 0).float())
+        pos_ratio = pos_sum / edge_count.clamp(min=1)
+
+        edge_stats = torch.stack([mean_abs, std_abs, density, pos_ratio], dim=1)
+
+        # Graphs with zero edges should report zeros, not NaN/inf.
+        empty_mask = edge_count == 0
+        if empty_mask.any():
+            edge_stats[empty_mask] = 0.0
         return edge_stats
 
     def forward(self, H, batch, edge_index=None, edge_weight=None):

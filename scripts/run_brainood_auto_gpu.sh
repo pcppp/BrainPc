@@ -19,7 +19,7 @@ fi
 if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$HOME/miniconda3/etc/profile.d/conda.sh"
-  conda activate pc2 >/dev/null 2>&1 || true
+  conda activate pc1 >/dev/null 2>&1 || true
 fi
 
 

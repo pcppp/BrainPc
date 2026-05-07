@@ -93,16 +93,12 @@ class BrainOOD(BaseOODAlg):
 
         self.mean_loss = loss.mean()
 
-        # Gate sparsity + affine regularization from SiteCalibration
-        if hasattr(self.model, 'calib_info') and self.model.calib_info:
-            ci = self.model.calib_info
-            gate_lambda = getattr(config.ood, 'gate_sparsity_weight', 0.01)
-            affine_lambda = getattr(config.ood, 'affine_reg_weight', 0.01)
-            if gate_lambda > 0:
-                self.mean_loss = self.mean_loss + gate_lambda * ci['gate_reg']
-            if affine_lambda > 0:
-                self.mean_loss = self.mean_loss + affine_lambda * ci['affine_reg']
-
+        # Gate sparsity + affine regularization for SiteCalibration are handled
+        # in Pipeline._compute_total_loss with a ramp schedule. Adding them
+        # here as well used to apply both terms twice (the original "baseline"
+        # weight here plus a ramped weight in the pipeline), so the effective
+        # weight grew to 2x the configured value once ramp saturated. The
+        # pipeline's ramped formulation is the single source of truth now.
         return self.mean_loss
 
     def get_r(self, decay_interval, decay_r, current_epoch, init_r=0.9, final_r=0.5):

@@ -47,31 +47,32 @@ class Pipeline:
 
 
 
-    def train_batch(self, data: Batch, pbar) -> dict:
-        r"""
-        Train a batch: classification + GBCR losses.
+    def _compute_total_loss(self, data: Batch, allow_aux: bool = True,
+                            enable_site_adv: bool = True):
+        r"""Forward pass + cls + (optional) stage-aware aux losses.
 
-        GBCR is embedded in the GNN forward pass (between GAT layers).
-        After forward, we extract GBCR info for auxiliary losses:
-          - L_align: class-conditional ball importance alignment across sites
-          - L_entropy: assignment entropy (balanced balls)
-          - L_site: site adversarial on calibrated features
+        This helper is the single source of truth for the training-time
+        loss formulation. It does NOT touch the optimizer / backward /
+        parameter freezes — those live in train_batch and
+        _train_episode so the same loss can be reused inside an
+        episodic meta-learning step.
 
-        Staged training (max_epoch=35, early_stop from epoch 25):
-        Stage 1 (epoch < 8):   cls + gate losses (SiteCalibration learns freely)
-        Stage 2 (8 <= epoch < 20): + SiteAdv (weight=0.05)
-        Stage 3 (18 <= epoch < 25): + GBCR (7 epochs of training)
-        Stage 4 (epoch >= 25):  all aux frozen, backbone-only finetune
-        Early stopping only allowed from epoch 25+; ckpt candidates from epoch 10+.
+        Args:
+            data: a PyG Batch.
+            allow_aux: if False only classification (+ gate/affine reg
+                from loss_postprocess) is returned. Used for the
+                meta-test pass when meta_test_aux is disabled.
+
+        Returns:
+            (loss, spec, data) — loss tensor, dict of per-component scalar
+            values for logging, and the input batch (already moved to the
+            target device by input_preprocess).
         """
         data = data.to(self.config.device)
-        self.ood_algorithm.optimizer.zero_grad()
 
-        # --- 1. Forward pass (GBCR runs inside GNN automatically) ---
         mask, targets = nan2zero_get_mask(data, 'train', self.config)
         node_norm = data.get('node_norm') if self.config.model.model_level == 'node' else None
         node_norm = node_norm.reshape(targets.shape) if node_norm is not None else None
-
         data, targets, mask, node_norm = self.ood_algorithm.input_preprocess(
             data, targets, mask, node_norm, self.model.training, self.config
         )
@@ -83,120 +84,182 @@ class Pipeline:
         cls_loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
         cls_loss = self.ood_algorithm.loss_postprocess(cls_loss, data, mask, self.config)
 
-        # --- 2. Staged auxiliary losses ---
+        spec = {'Align': 0.0, 'Entropy': 0.0, 'SiteAdv': 0.0, 'GateAlign': 0.0}
+
+        if not allow_aux:
+            return cls_loss, spec, data
+
         epoch = self.config.train.epoch
         site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 8)
         site_adv_stop = getattr(self.config.train, 'site_adv_stop_epoch', 20)
         gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 18)
         gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
-
-        align_val = 0.0
-        entropy_val = 0.0
-        site_adv_val = 0.0
-        gate_align_val = 0.0
-
-        # --- Stage 1: gate regularization (delayed to let gate learn first) ---
         gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 8)
-        calib_info = self.model.calib_info
-        if calib_info:
-            if epoch >= gate_reg_warmup:
-                # Linear warmup over 5 epochs after warmup starts
-                ramp = min(1.0, (epoch - gate_reg_warmup + 1) / 5.0)
 
-                # L_aff = ||gamma-1||^2 + ||beta||^2 (keeps affine mild)
-                affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.005) * ramp
-                cls_loss = cls_loss + affine_w * calib_info['affine_reg']
+        # --- Stage 1: gate-range / affine / gate-alignment regularization ---
+        calib_info = self.model.calib_info if hasattr(self.model, 'calib_info') else None
+        if calib_info and epoch >= gate_reg_warmup:
+            ramp = min(1.0, (epoch - gate_reg_warmup + 1) / 5.0)
 
-                # L_gate-range: penalize if gate mean outside [0.05, 0.15]
-                gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.05) * ramp
-                cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
+            affine_w = getattr(self.config.ood, 'affine_reg_weight', 0.005) * ramp
+            cls_loss = cls_loss + affine_w * calib_info['affine_reg']
 
-                # L_gate-align: EMA-smoothed alignment, also warmed up
-                if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
-                    gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.1) * ramp
-                    y_graph = data.y.view(-1)
-                    env_graph = data.env_id.view(-1)
-                    num_graphs = calib_info['gate'].size(0)
-                    if y_graph.size(0) == num_graphs and env_graph.size(0) == num_graphs:
-                        gate_align_loss = self.model.site_calibration.gate_alignment_loss(
-                            calib_info['gate'], None, y_graph, env_graph)
-                        gate_align_val = gate_align_loss.item()
-                        cls_loss = cls_loss + gate_align_w * gate_align_loss
+            gate_sp_w = getattr(self.config.ood, 'gate_sparsity_weight', 0.05) * ramp
+            cls_loss = cls_loss + gate_sp_w * calib_info['gate_reg']
 
-        # --- Stage 2 (site_adv_warmup <= epoch < site_adv_stop): SiteAdv ---
-        if site_adv_warmup <= epoch < site_adv_stop and getattr(data, 'num_graphs', 1) >= 2:
+            if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
+                gate_align_w = getattr(self.config.ood, 'gate_align_weight', 0.1) * ramp
+                y_graph = data.y.view(-1)
+                env_graph = data.env_id.view(-1)
+                num_graphs = calib_info['gate'].size(0)
+                if y_graph.size(0) == num_graphs and env_graph.size(0) == num_graphs:
+                    gate_align_loss = self.model.site_calibration.gate_alignment_loss(
+                        calib_info['gate'], None, y_graph, env_graph)
+                    spec['GateAlign'] = gate_align_loss.item()
+                    cls_loss = cls_loss + gate_align_w * gate_align_loss
+
+        # --- Stage 2: SiteAdv ---
+        # Disabled in episodic mode (caller passes enable_site_adv=False) because
+        # each meta-train batch contains a single site → cross-entropy on a
+        # constant site label is degenerate and gives no useful gradient.
+        if (enable_site_adv and site_adv_warmup <= epoch < site_adv_stop
+                and getattr(data, 'num_graphs', 1) >= 2):
             site_adv_w = getattr(self.config.ood, 'site_adv_weight', 0.05)
             if site_adv_w > 0 and self.model.site_calibration.site_classifier is not None:
                 if hasattr(data, 'env_id') and data.env_id is not None:
-                    # Use calibrated features from encoder (already computed in forward)
                     encoder = self.model.gnn.encoder
                     if encoder._calib_info is not None:
                         batch_idx = data.batch if data.batch is not None else torch.zeros(
                             data.x.size(0), dtype=torch.long, device=data.x.device)
-                        # Get post-GAT1+calib node features for site adversarial
-                        # We reuse the encoder's stored calibrated output
-                        # Actually run site_adv on the graph-level pooled calibrated features
-                        grl_lam = self.config.train.alpha
-                        # Forward through site_calibration was already done in encoder
-                        # We need the calibrated H for site_adv — it's post_conv after calib
-                        # For simplicity, re-run calibration on the stored H1
-                        # But actually, the encoder already ran it. We use the model-level
-                        # site_adversarial_loss which pools and classifies.
-                        # We need to get H_calibrated from encoder. Let's add it.
+                        grl_lam = getattr(self.config.train, 'alpha', 1.0)
                         if hasattr(encoder, '_h_calibrated'):
                             site_adv_loss = self.model.site_calibration.site_adversarial_loss(
                                 encoder._h_calibrated, batch_idx, data.env_id, grl_lambda=grl_lam)
-                            site_adv_val = site_adv_loss.item()
+                            spec['SiteAdv'] = site_adv_loss.item()
                             cls_loss = cls_loss + site_adv_w * site_adv_loss
 
-        # --- Stage 3 (gbcr_warmup <= epoch < gbcr_stop): short GBCR warm-up window ---
+        # --- Stage 3: GBCR (alignment + entropy) ---
         if gbcr_warmup <= epoch < gbcr_stop and getattr(data, 'num_graphs', 1) >= 2:
-            # Freeze gate parameters
             for p in self.model.site_calibration.parameters():
                 p.requires_grad = False
-
             gbcr_info = self.model.get_gbcr_info()
             if gbcr_info is not None:
                 gbcr_module = self.model.gnn.encoder.gbcr
-
-                # Class-conditional importance alignment across sites
                 lambda_align = getattr(self.config.ood, 'gbcr_align_weight', 0.1)
                 if hasattr(data, 'env_id') and data.env_id is not None and hasattr(data, 'y'):
                     align_loss_val = gbcr_module.importance_alignment_loss(
                         data.batch, data.y.view(-1), data.env_id)
                     if align_loss_val.item() > 0:
-                        align_val = align_loss_val.item()
+                        spec['Align'] = align_loss_val.item()
                         cls_loss = cls_loss + lambda_align * align_loss_val
 
-                # Assignment entropy (balanced balls)
                 lambda_entropy = getattr(self.config.ood, 'gbcr_entropy_weight', 0.05)
                 entropy_loss = gbcr_module.assignment_entropy_loss()
                 if entropy_loss.item() > 0:
-                    entropy_val = entropy_loss.item()
+                    spec['Entropy'] = entropy_loss.item()
                     cls_loss = cls_loss + lambda_entropy * entropy_loss
 
-        cls_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.ood_algorithm.optimizer.step()
+        return cls_loss, spec, data
 
-        # Keep gate frozen from gbcr_warmup onward (site_calibration already static).
+    def _apply_post_step_freezes(self):
+        r"""Stage-aware parameter freezing applied AFTER each optimizer step."""
+        epoch = self.config.train.epoch
+        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 18)
+        gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
+
         if epoch >= gbcr_warmup:
             for p in self.model.site_calibration.parameters():
                 p.requires_grad = False
-        # Stage 4: after gbcr_stop, freeze GBCR so only backbone trains.
-        if epoch >= gbcr_stop and hasattr(self.model.gnn, 'encoder') and hasattr(self.model.gnn.encoder, 'gbcr'):
+        if (epoch >= gbcr_stop
+                and hasattr(self.model.gnn, 'encoder')
+                and hasattr(self.model.gnn.encoder, 'gbcr')):
             for p in self.model.gnn.encoder.gbcr.parameters():
                 p.requires_grad = False
 
-        # Store for logging
-        self.ood_algorithm.spec_loss = {
-            'Align': align_val,
-            'Entropy': entropy_val,
-            'SiteAdv': site_adv_val,
-            'GateAlign': gate_align_val,
-        }
+    def train_batch(self, data: Batch, pbar) -> dict:
+        r"""Standard single-batch training step.
 
+        Forward → cls + stage-aware aux losses → backward → step. The loss
+        formulation lives in _compute_total_loss so it can be reused by
+        the episodic meta-learning path without divergence.
+        """
+        self.ood_algorithm.optimizer.zero_grad()
+        cls_loss, spec, _ = self._compute_total_loss(data, allow_aux=True)
+        cls_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.ood_algorithm.optimizer.step()
+        self._apply_post_step_freezes()
+        self.ood_algorithm.spec_loss = spec
         return {'loss': cls_loss.detach()}
+
+    def _train_episode(self, site_iterators, site_loaders, source_sites,
+                       lambda_meta: float, meta_test_aux: bool, rng) -> dict:
+        r"""One episodic meta-learning step (MLDG-style first-order).
+
+        1. Pick one source site as meta_test_site, the rest as
+           meta_train_sites. Only training source sites are sampled —
+           real OOD test sites are not part of site_loaders so they
+           cannot leak in.
+        2. For each meta-train site: pull a batch, forward, compute the
+           full loss (cls + all stage-aware aux losses), and accumulate.
+        3. For the meta-test site: pull a batch, forward, compute either
+           cls-only (default) or full loss depending on meta_test_aux.
+        4. loss_total = mean(meta_train) + λ_meta * meta_test.
+        5. Backward + clip + optimizer step + post-step parameter freezes.
+
+        First-order only — no model cloning, no second-order grad.
+        """
+        from .episodic_meta import sample_episode, next_site_batch
+
+        meta_train_sites, meta_test_site = sample_episode(source_sites, rng)
+
+        self.ood_algorithm.optimizer.zero_grad()
+
+        loss_meta_train = None
+        spec_acc = {'Align': 0.0, 'Entropy': 0.0, 'SiteAdv': 0.0, 'GateAlign': 0.0}
+        n_meta_train = 0
+        for site in meta_train_sites:
+            batch = next_site_batch(site_iterators, site_loaders, site)
+            if batch is None:
+                continue
+            l_train, spec, _ = self._compute_total_loss(batch, allow_aux=True, enable_site_adv=False)
+            loss_meta_train = l_train if loss_meta_train is None else loss_meta_train + l_train
+            for k in spec_acc:
+                spec_acc[k] += spec[k]
+            n_meta_train += 1
+
+        if n_meta_train == 0:
+            # Degenerate: no usable meta-train batch — fall back to a normal step.
+            return self.train_batch(next_site_batch(site_iterators, site_loaders, meta_test_site), None)
+        loss_meta_train = loss_meta_train / float(n_meta_train)
+        for k in spec_acc:
+            spec_acc[k] /= float(n_meta_train)
+
+        batch_test = next_site_batch(site_iterators, site_loaders, meta_test_site)
+        loss_meta_test, spec_test, _ = self._compute_total_loss(batch_test, allow_aux=meta_test_aux, enable_site_adv=False)
+
+        loss_total = loss_meta_train + lambda_meta * loss_meta_test
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.ood_algorithm.optimizer.step()
+        self._apply_post_step_freezes()
+
+        spec_log = dict(spec_acc)
+        for k in spec_log:
+            spec_log[k] = (spec_log[k] + spec_test.get(k, 0.0)) / 2.0
+        spec_log['MetaTrain'] = float(loss_meta_train.detach().item())
+        spec_log['MetaTest'] = float(loss_meta_test.detach().item())
+        self.ood_algorithm.spec_loss = spec_log
+        # Mirror mean_loss so existing per-epoch averaging logic still runs.
+        self.ood_algorithm.mean_loss = loss_total.detach()
+
+        return {
+            'loss': loss_total.detach(),
+            'loss_meta_train': float(loss_meta_train.detach().item()),
+            'loss_meta_test': float(loss_meta_test.detach().item()),
+            'meta_test_site': int(meta_test_site),
+            'meta_train_sites': [int(s) for s in meta_train_sites],
+        }
 
     def train(self, fold=0):
         r"""
@@ -221,6 +284,45 @@ class Pipeline:
         patience_counter = 0
         best_patience_score = -1.0
 
+        # ----- Episodic meta-learning setup (optional) ---------------------
+        # Activated by config.ood.use_episodic_meta. Builds one DataLoader per
+        # source site so each episode can sample a held-out "meta-test" site
+        # while training on the rest. ONLY uses train-source sites — the real
+        # OOD val / OOD test sites are not in site_loaders so they cannot leak.
+        use_episodic_meta = bool(getattr(self.config.ood, 'use_episodic_meta', False))
+        lambda_meta = float(getattr(self.config.ood, 'lambda_meta', 0.5))
+        meta_test_aux = bool(getattr(self.config.ood, 'meta_test_aux', False))
+        min_sites = int(getattr(self.config.ood, 'min_sites_per_episode', 2))
+        site_loaders = None
+        site_iterators = None
+        source_sites = None
+        meta_rng = None
+        steps_per_epoch_meta = 0
+        if use_episodic_meta:
+            from .episodic_meta import build_site_loaders
+            train_dataset = self.loader['train'].dataset
+            site_loaders, source_sites, site_sizes = build_site_loaders(
+                train_dataset,
+                batch_size=self.config.train.train_bs,
+                num_workers=getattr(self.config, 'num_workers', 0),
+                seed=int(getattr(self.config, 'random_seed', 0)),
+            )
+            print(f'#IN# [Meta] source_sites={source_sites}  sizes={site_sizes}')
+            if len(source_sites) < min_sites:
+                print(f'#IN# [Meta] only {len(source_sites)} source site(s) — '
+                      f'falling back to standard training (need >={min_sites}).')
+                use_episodic_meta = False
+            else:
+                meta_rng = __import__("random").Random(int(getattr(self.config, 'random_seed', 0)))
+                site_iterators = {s: iter(site_loaders[s]) for s in source_sites}
+                # Match the standard training-step budget per epoch.
+                try:
+                    steps_per_epoch_meta = max(1, len(self.loader['train']))
+                except TypeError:
+                    steps_per_epoch_meta = 1
+                print(f'#IN# [Meta] use_episodic_meta=True  λ_meta={lambda_meta}  '
+                      f'meta_test_aux={meta_test_aux}  steps/epoch={steps_per_epoch_meta}')
+
         for epoch in range(max_epochs):
             self.config.train.epoch = epoch
             mean_loss = 0
@@ -229,23 +331,52 @@ class Pipeline:
             self.ood_algorithm.stage_control(self.config)
 
             last_trained_data = None
-            for index, data in enumerate(self.loader['train']):
-                if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
-                    continue
-                p = (index / len(self.loader['train']) + epoch) / max_epochs
-                self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
-                train_stat = self.train_batch(data, None)
-                last_trained_data = data  # aligns with encoder._h_pre_gate / _h_calibrated
-                mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
-
-                if self.ood_algorithm.spec_loss is not None:
-                    if isinstance(self.ood_algorithm.spec_loss, dict):
+            episode_log = None  # populated only in episodic mode
+            if use_episodic_meta:
+                training_mode = 'episodic_meta_learning'
+                for index in range(steps_per_epoch_meta):
+                    p = (index / steps_per_epoch_meta + epoch) / max_epochs
+                    self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
+                    ep_stat = self._train_episode(
+                        site_iterators, site_loaders, source_sites,
+                        lambda_meta=lambda_meta,
+                        meta_test_aux=meta_test_aux,
+                        rng=meta_rng,
+                    )
+                    episode_log = ep_stat
+                    mean_loss = (mean_loss * index + float(ep_stat['loss'].item())) / (index + 1)
+                    if self.ood_algorithm.spec_loss is not None and isinstance(self.ood_algorithm.spec_loss, dict):
                         if not isinstance(spec_loss, dict):
                             spec_loss = dict()
                         for loss_name, loss_value in self.ood_algorithm.spec_loss.items():
                             if loss_name not in spec_loss:
                                 spec_loss[loss_name] = 0
                             spec_loss[loss_name] = (spec_loss[loss_name] * index + loss_value) / (index + 1)
+                if episode_log is not None:
+                    print(f"#IN# [MetaEpisode] meta_test_site={episode_log['meta_test_site']} "
+                          f"meta_train_sites={episode_log['meta_train_sites']} "
+                          f"loss_meta_train={episode_log['loss_meta_train']:.4f} "
+                          f"loss_meta_test={episode_log['loss_meta_test']:.4f} "
+                          f"loss_total={float(episode_log['loss'].item()):.4f}")
+            else:
+                training_mode = 'standard'
+                for index, data in enumerate(self.loader['train']):
+                    if data.batch is not None and (data.batch[-1] < self.config.train.train_bs - 1):
+                        continue
+                    p = (index / len(self.loader['train']) + epoch) / max_epochs
+                    self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
+                    train_stat = self.train_batch(data, None)
+                    last_trained_data = data  # aligns with encoder._h_pre_gate / _h_calibrated
+                    mean_loss = (mean_loss * index + self.ood_algorithm.mean_loss) / (index + 1)
+
+                    if self.ood_algorithm.spec_loss is not None:
+                        if isinstance(self.ood_algorithm.spec_loss, dict):
+                            if not isinstance(spec_loss, dict):
+                                spec_loss = dict()
+                            for loss_name, loss_value in self.ood_algorithm.spec_loss.items():
+                                if loss_name not in spec_loss:
+                                    spec_loss[loss_name] = 0
+                                spec_loss[loss_name] = (spec_loss[loss_name] * index + loss_value) / (index + 1)
 
             # Print training loss
             if self.ood_algorithm.spec_loss is not None and isinstance(spec_loss, dict):
@@ -821,6 +952,18 @@ class Pipeline:
             'val_loss': val_stat['loss'],
             'test_score': test_stat['score'],
             'test_loss': test_stat['loss'],
+            # Subject-count-weighted mix of ID and OOD scores. Without these,
+            # compute_10fold_metrics fell back to val_score (= ood_val_score)
+            # and "Val/Test" columns in grid_results.xlsx silently reported
+            # OOD-only numbers instead of the intended ID+OOD mix.
+            'mixed_val_score': (
+                val_stat['score'] * val_stat['subject_num']
+                + id_val_stat['score'] * id_val_stat['subject_num']
+            ) / max(val_stat['subject_num'] + id_val_stat['subject_num'], 1),
+            'mixed_test_score': (
+                test_stat['score'] * test_stat['subject_num']
+                + id_test_stat['score'] * id_test_stat['subject_num']
+            ) / max(test_stat['subject_num'] + id_test_stat['subject_num'], 1),
             'id_val_subject_num': id_val_stat['subject_num'],
             'id_test_subject_num': id_test_stat['subject_num'],
             'ood_val_subject_num': val_stat['subject_num'],

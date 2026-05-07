@@ -21,6 +21,14 @@ ood:
     - 20
     - 0.7
     - 3
+  # --- Episodic meta-learning (site-level MLDG-style) ---
+  # When use_episodic_meta is True, each training step samples one source
+  # site as the held-out meta-test domain and uses the rest as meta-train.
+  # Only training-source sites are sampled — never the real OOD test site.
+  use_episodic_meta: true
+  lambda_meta: 0.5
+  meta_test_aux: false
+  min_sites_per_episode: 2
 train:
   max_epoch: 35
   lr: 1e-3

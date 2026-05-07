@@ -85,3 +85,154 @@ The sample-level statistical-aware calibration module has been refactored:
 - **Training**: 3-stage schedule — gate-only (0-10), +SiteAdv (10-20), freeze gate + GBCR (20+)
 - **Losses**: L_aff (affine constraint) + L_sp (gate sparsity) + L_gate-align (class-conditional gate alignment)
 - **Monitoring**: Every epoch prints mean(g), std(g), ||γ-1||, ||β|| for gate interpretability
+
+
+## Episodic Meta-Learning (site-level MLDG, branch `meta-learning`)
+
+Adds a first-order, MLDG-style episodic training loop on top of the existing
+`SiteCalibration + GBCR + SiteAdv` stack. Each training step now performs:
+
+1. Pick one **source site** as the held-out *meta-test domain*; the rest are
+   the *meta-train domains*.
+2. Pull a batch from each meta-train site → forward → compute the full loss
+   (cls + gate/affine/gate-align + SiteAdv + GBCR), accumulate, average.
+3. Pull a batch from the meta-test site → forward → compute either cls-only
+   (default) or the full loss, controlled by `meta_test_aux`.
+4. `loss_total = mean(meta_train losses) + λ_meta * meta_test loss`.
+5. Backward + grad-clip + optimizer step + post-step parameter freezes.
+
+**Important — no data leakage.** `meta_test_site` is sampled only from the
+sites in the *training* split (`self.loader['train'].dataset`). The real
+OOD val / OOD test loaders are not part of `site_loaders`, so unseen
+domains can never enter training.
+
+### Code structure
+
+- `GOOD/kernel/pipelines/episodic_meta.py` — helpers:
+  - `build_site_loaders(train_dataset, batch_size, num_workers, seed)`
+  - `sample_episode(source_sites, rng)`
+  - `next_site_batch(site_iterators, site_loaders, site)` (auto-resets on
+    iterator exhaustion → cyclic sampling for small sites).
+- `GOOD/kernel/pipelines/basic_pipeline.py`:
+  - `Pipeline._compute_total_loss(data, allow_aux)` — single source of
+    truth for the training loss; reused by both `train_batch` and the
+    episodic step so the loss formulation cannot drift.
+  - `Pipeline._train_episode(...)` — one episodic step (first-order, no
+    model cloning, no `create_graph=True`).
+  - `Pipeline.train()` — auto-builds per-site DataLoaders when
+    `use_episodic_meta` is on and dispatches to `_train_episode` for
+    each step; otherwise the existing standard loop runs unchanged.
+- `configs/GOOD_configs/GOODABIDE/site/concept/BrainOOD.yaml` — new keys:
+
+  ```yaml
+  ood:
+    use_episodic_meta: false       # master switch
+    lambda_meta: 0.5               # weight on meta-test loss
+    meta_test_aux: false           # if true, meta-test also includes aux losses
+    min_sites_per_episode: 2       # auto-fallback to standard if <2 source sites
+  ```
+
+### Episode example (4 source sites `[A, B, C, D]`)
+
+```text
+Episode 1: meta_train=[A,B,C]   meta_test=D
+Episode 2: meta_train=[A,B,D]   meta_test=C
+Episode 3: meta_train=[A,C,D]   meta_test=B
+Episode 4: meta_train=[B,C,D]   meta_test=A
+```
+
+`meta_test_site` is uniformly sampled at random per step. Real OOD test
+sites are never part of this rotation.
+
+### Logging
+
+Per epoch, additionally to the existing `Train / ID_val / OOD_val /
+OOD_test / Gate / GBCR / SiteAdv` lines, each episode prints:
+
+```text
+[MetaEpisode] meta_test_site=<id> meta_train_sites=[...]
+              loss_meta_train=... loss_meta_test=... loss_total=...
+```
+
+`spec_loss` for the epoch contains `MetaTrain` and `MetaTest` entries on
+top of the existing `Align / Entropy / SiteAdv / GateAlign`.
+
+### Notes
+
+- First-order only. No `higher`, no `fast_weights`, no second-order
+  gradients.
+- Validation, test, evaluation, checkpoint NMS, MA5 ensemble, and
+  threshold tuning are unchanged.
+- If only one training source site exists, the pipeline prints a warning
+  and falls back to standard training.
+- Batch size for each site is `min(train_bs, site_size)`; small sites are
+  cycled via `next_site_batch` so they keep contributing every episode.
+
+
+## Performance / correctness fixes (meta-learning branch, 2026-05-07)
+
+Three follow-up changes on top of the episodic meta-learning scaffolding.
+All are local to existing modules — no new files, no API change for callers.
+
+### 1. Single-round forward in `GDGMT` (was `sampling_rounds=3`)
+
+`GOOD/networks/models/GDGMT.py` — the `while len(sampling_logits) < 3` loop
+in `forward()` is removed. Each round ran the same forward with the same
+inputs (only randomness was dropout / meta-net noise), so averaging gave
+near-zero variance reduction while tripling the forward cost — particularly
+painful in episodic mode, where one step already runs `(K-1) + 1` forwards.
+The class still accepts `config.ood.extra_param[3]` for backward-compat but
+the value is now ignored.
+
+### 2. `site_adv` disabled in episodic mode
+
+`GOOD/kernel/pipelines/basic_pipeline.py`:
+- `_compute_total_loss(... enable_site_adv: bool = True)` gates the SiteAdv
+  block on this flag.
+- `_train_episode` always passes `enable_site_adv=False` for both
+  meta-train and meta-test forwards.
+
+Reason: each meta-train batch contains a single site, so cross-entropy on a
+constant site label is degenerate (`H = log(num_sites)` plus tiny noise) and
+gives no useful gradient. Standard non-episodic training is unaffected
+(default flag `True`).
+
+### 3. `SiteCalibration._compute_edge_stats` vectorised
+
+`GOOD/networks/models/SiteCalibration.py` — the `for g in range(num_graphs)`
+loop is replaced by `scatter_add_` aggregation, eliminating ~64 GPU-sync
+points per batch. Mean / density / pos_ratio match the old loop exactly;
+`std` switches from unbiased (`n-1`) to population (`sqrt(E[w²]-E[w]²)`),
+which makes single-edge graphs return 0 instead of NaN. The relative
+difference is `sqrt(n/(n-1))` which is < 0.02% for graphs with > 1000 edges
+and is washed out by the downstream `LayerNorm` anyway.
+
+
+## Correctness fixes (meta-learning branch, 2026-05-07 cont.)
+
+### 4. Single source of truth for gate / affine regularization (`C2`)
+
+`GOOD/ood_algorithms/algorithms/BrainOOD.py` — `loss_postprocess` no longer
+adds `gate_sparsity_weight·gate_reg + affine_reg_weight·affine_reg`. Those
+terms are kept only in `Pipeline._compute_total_loss`, which already applies
+them with a 5-epoch ramp starting at `gate_reg_warmup`. Previously both
+sites added the same terms, so once `ramp` saturated to 1 the effective
+weight was 2x the configured value — i.e. all prior runs had been training
+under `gate_sparsity_weight=0.10` and `affine_reg_weight=0.010` instead
+of the YAML-declared `0.05 / 0.005`. Subsequent runs will use the
+configured values exactly.
+
+### 5. `mixed_val/test_score` written into training-time checkpoints (`C3`)
+
+`GOOD/kernel/pipelines/basic_pipeline.py:_build_ckpt` — adds:
+
+```python
+'mixed_val_score':  (val_score·val_n + id_val_score·id_val_n) / (val_n + id_val_n),
+'mixed_test_score': (test_score·test_n + id_test_score·id_test_n) / (test_n + id_test_n),
+```
+
+so the ckpts produced during `Pipeline.train()` carry the same fields as
+`save_epoch`. Without them, `compute_10fold_metrics` fell back to
+`val_score` (= `ood_val_score`) and the "Val / Test" columns in
+`logs/grid_results.xlsx` silently reported OOD-only numbers, not the
+ID+OOD mix the column header implied.

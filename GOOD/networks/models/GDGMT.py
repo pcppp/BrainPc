@@ -266,17 +266,19 @@ class GDGMT(GNNBasic):
                 graph_emb, _ = self.gnn(*args, **kwargs)
             return self.proj_head(graph_emb)
 
-        # --- Finetune mode: classification with sampling ---
-        sampling_logits = []
-        sampling_trials = self.sampling_rounds
-        while len(sampling_logits) < sampling_trials:
-            if node_features is not None:
-                x_out, diff_loss = self.gnn(node_features, *args, **kwargs)
-            else:
-                x_out, diff_loss = self.gnn(*args, **kwargs)
-            x_out_drop = self.classifier_dropout(x_out) if self.training else x_out
-            sampling_logits.append(self.classifier(x_out_drop))
-        logits = torch.stack(sampling_logits).mean(dim=0)
+        # --- Finetune mode: single-round classification ---
+        # Note: previous implementations wrapped this in a sampling_rounds loop
+        # (default=3) to average over stochastic gate / dropout. The averaging
+        # was nearly free of variance reduction (every round runs the same
+        # forward with the same inputs) and tripled forward cost — especially
+        # painful in episodic mode where each step already runs ~K forwards.
+        # sampling_rounds is now ignored.
+        if node_features is not None:
+            x_out, diff_loss = self.gnn(node_features, *args, **kwargs)
+        else:
+            x_out, diff_loss = self.gnn(*args, **kwargs)
+        x_out_drop = self.classifier_dropout(x_out) if self.training else x_out
+        logits = self.classifier(x_out_drop)
         # Retrieve calib info from encoder (set during forward)
         encoder = self.gnn.encoder if hasattr(self.gnn, 'encoder') else None
         if encoder is not None and encoder._calib_info is not None:

@@ -216,12 +216,17 @@ class GDGMT(GNNBasic):
         # Sample-level site calibration (placed between GAT1 and GAT2 inside encoder)
         num_sites = getattr(config.dataset, 'num_envs', 0) or 0
         num_sites = max(num_sites, 20) if num_sites > 0 else 0
+        # SiteCalibration v3: alpha=0.25 + scale_bound=0.2 was the original
+        # design intent. The 0.1/0.1 fallback was a safety margin during the
+        # "gate/affine reg applied twice" era (BrainOOD.loss_postprocess +
+        # _compute_total_loss both adding the same terms) — once C2 fixed
+        # that, the conservative bounds left the meta-network underpowered.
         self.site_calibration = SiteCalibration(
             feat_dim=config.model.dim_hidden,  # mid-level dim after GAT1
             gate_init_bias=getattr(config.model, 'calib_gate_init', -1.7),
             num_sites=num_sites,
-            alpha=0.1,
-            scale_bound=0.1,
+            alpha=getattr(config.model, 'calib_alpha', 0.25),
+            scale_bound=getattr(config.model, 'calib_scale_bound', 0.2),
         )
         # Inject into encoder so it runs between GAT1 and GBCR
         self.gnn.encoder.site_calibration = self.site_calibration

@@ -37,14 +37,23 @@ def build_site_loaders(
     batch_size: int,
     num_workers: int = 0,
     seed: int = 0,
+    batch_size_per_site: Optional[int] = None,
 ) -> Tuple[Dict[int, DataLoader], List[int], Dict[int, int]]:
     """Group train_dataset by env_id and build one DataLoader per site.
 
+    The episodic step pools batches from K-1 meta-train sites into a single
+    forward, so each per-site loader yields a SMALL batch and the pooled
+    batch lands close to the configured train_bs total.
+
     Args:
-        train_dataset: iterable of PyG Data objects (each must carry env_id).
-        batch_size:    per-site batch size.
-        num_workers:   DataLoader workers.
-        seed:          base seed for per-site torch.Generator (for reproducibility).
+        train_dataset:        iterable of PyG Data objects (each carrying env_id).
+        batch_size:           target *total* batch size for the pooled meta-train
+                              forward (used to derive batch_size_per_site
+                              when that argument is None).
+        num_workers:          DataLoader workers.
+        seed:                 base seed for per-site torch.Generator.
+        batch_size_per_site:  explicit per-site batch size. If None, computed as
+                              max(1, batch_size // num_sites).
 
     Returns:
         site_loaders: {site_id -> DataLoader}
@@ -64,13 +73,19 @@ def build_site_loaders(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
+    if batch_size_per_site is None:
+        # Pooled meta-train batch covers K-1 of the K source sites; size each
+        # per-site contribution so the pooled total is roughly batch_size.
+        batch_size_per_site = max(1, batch_size // max(1, len(source_sites)))
+
     site_loaders: Dict[int, DataLoader] = {}
     for sid in source_sites:
         sub = by_site[sid]
-        # If site has fewer samples than batch_size, drop_last=False so we still
-        # yield at least one batch per site; cyclic sampling in next_site_batch
-        # will refill on exhaustion.
-        bs = min(batch_size, max(1, len(sub)))
+        # If site has fewer samples than the requested per-site batch size,
+        # drop_last=False so we still yield at least one (possibly smaller)
+        # batch per site; cyclic sampling in next_site_batch refills on
+        # iterator exhaustion.
+        bs = min(batch_size_per_site, max(1, len(sub)))
         g = torch.Generator()
         g.manual_seed(seed + int(sid))
         site_loaders[sid] = DataLoader(

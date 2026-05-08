@@ -29,15 +29,21 @@ ood:
   lambda_meta: 0.5
   meta_test_aux: false
   min_sites_per_episode: 2
+  # Steps per epoch in episodic mode = round(meta_steps_mult * len(train_loader)).
+  # Pooled meta-train batches are smaller than standard-mode batches; 1.5x
+  # default keeps total graph-forwards comparable to standard mode.
+  meta_steps_mult: 1.5
 train:
   max_epoch: 35
   lr: 1e-3
-  weight_decay: 1e-3
+  weight_decay: 1e-4
   ball_r: 0.5
   gb_weight: 0.02
   label_smoothing: 0.05
   patience: 8
   classifier_dropout: 0.5
-  # Staged training: epoch thresholds
-  gate_warmup_epoch: 10
-  contrastive_warmup_epoch: 20
+  # Staged training thresholds are now expressed as FRACTIONS of max_epoch
+  # via Pipeline._stage_epoch() — see basic_pipeline.py for the defaults.
+  # Override absolutes here only if you need a custom schedule, e.g.
+  #   gate_warmup_epoch: 10
+  #   gbcr_warmup_epoch: 22

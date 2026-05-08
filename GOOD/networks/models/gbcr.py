@@ -29,18 +29,16 @@ class GBCR(nn.Module):
         feat_dim: dimension of mid-level node features (dim_hidden)
         num_balls: number of granular balls K (12-16 for 100 ROI)
         alpha_node: residual scaling for node reweight (0.1-0.2)
-        alpha_edge: residual scaling for edge reweight (0.2-0.3)
         tau: temperature for soft assignment (lower = harder)
     """
 
     def __init__(self, feat_dim: int, num_balls: int = 14,
-                 alpha_node: float = 0.15, alpha_edge: float = 0.25,
+                 alpha_node: float = 0.15,
                  tau: float = 1.0):
         super().__init__()
         self.feat_dim = feat_dim
         self.num_balls = num_balls
         self.alpha_node = alpha_node
-        self.alpha_edge = alpha_edge
         self.tau = tau
 
         # Step 1: Soft assignment projection
@@ -53,14 +51,9 @@ class GBCR(nn.Module):
             nn.Linear(feat_dim // 2, 1),
         )
 
-        # Step 3b: Ball edge importance bilinear weight
-        self.W_s = nn.Parameter(torch.empty(feat_dim, feat_dim))
-        nn.init.xavier_uniform_(self.W_s)
-
         # Stored for loss computation
         self._last_Q = None
         self._last_r = None
-        self._last_S = None
 
     def forward(self, H: torch.Tensor, edge_index: torch.Tensor,
                 batch: torch.Tensor) -> tuple:
@@ -91,37 +84,32 @@ class GBCR(nn.Module):
         # Ball-to-graph mapping
         ball_batch = torch.arange(num_graphs, device=device).repeat_interleave(self.num_balls)
 
-        # ---- Step 3a: Ball node importance ----
+        # ---- Step 3: Ball node importance ----
         r = torch.sigmoid(self.ball_importance(B).squeeze(-1))  # [total_balls]
 
-        # ---- Step 3b: Ball edge importance ----
-        # S_kl = σ(b_k^T W_s b_l) per graph
-        S = self._compute_ball_edge_importance(B, num_graphs)  # [total_balls, K] per graph
-
-        # ---- Step 4a: Node reweight ----
-        # u_i = sum_k Q_ik * r_k (for the graph that node i belongs to)
+        # ---- Step 4: Node reweight ----
+        # u_i = sum_k Q_ik * r_k for the graph that node i belongs to.
         u = self._ball_to_node_importance(Q, r, batch, num_graphs)  # [N]
         H_reweighted = H * (1.0 + self.alpha_node * u.unsqueeze(-1))
 
-        # ---- Step 4b: Edge importance for attention bias ----
-        # M_ij = sum_k,l Q_ik * S_kl * Q_jl
-        edge_importance = self._compute_edge_importance(
-            Q, S, edge_index, batch, num_graphs)  # [E]
+        # NOTE: ball-ball bilinear edge importance (W_s, _compute_edge_importance)
+        # was removed — it was computed every forward but never consumed by the
+        # downstream GAT layer (see GAT.py: convs use the original edge_weight),
+        # so it only inflated activation memory and contributed to OOM in
+        # episodic mode. Re-add later if/when GAT2 actually consumes a
+        # ball-derived edge bias.
 
-        # Store for loss
         self._last_Q = Q
         self._last_r = r
-        self._last_S = S
         self._last_ball_batch = ball_batch
 
         gbcr_info = {
             'Q': Q,           # [N, K] soft assignment
             'r': r,           # [total_balls] ball importance
-            'S': S,           # per-graph ball-ball importance
             'ball_batch': ball_batch,
         }
 
-        return H_reweighted, edge_importance, gbcr_info
+        return H_reweighted, gbcr_info
 
     def _per_graph_softmax(self, logits, batch, num_graphs):
         """Softmax over K balls, independently per graph."""
@@ -157,19 +145,6 @@ class GBCR(nn.Module):
         B = B / D.clamp(min=1e-6)
         return B
 
-    def _compute_ball_edge_importance(self, B, num_graphs):
-        """Compute S_kl = σ(b_k^T W_s b_l) per graph.
-
-        Returns: [num_graphs * K, K]
-        """
-        K = self.num_balls
-        # Reshape B to [num_graphs, K, d]
-        B_3d = B.view(num_graphs, K, -1)
-        # S = σ(B W_s B^T)  per graph
-        BW = torch.matmul(B_3d, self.W_s)  # [num_graphs, K, d]
-        S = torch.sigmoid(torch.bmm(BW, B_3d.transpose(1, 2)))  # [num_graphs, K, K]
-        return S.view(num_graphs * K, K)
-
     def _ball_to_node_importance(self, Q, r, batch, num_graphs):
         """Map ball importance r back to nodes: u_i = sum_k Q_ik * r_k.
 
@@ -182,29 +157,6 @@ class GBCR(nn.Module):
         r_per_node = r_3d[batch]  # [N, K]
         u = (Q * r_per_node).sum(dim=1)  # [N]
         return u
-
-    def _compute_edge_importance(self, Q, S, edge_index, batch, num_graphs):
-        """Compute per-edge importance: M_ij = sum_k,l Q_ik * S_kl * Q_jl.
-
-        Returns: [E]
-        """
-        K = self.num_balls
-        src, dst = edge_index  # [E]
-
-        # S is [num_graphs*K, K], reshape to [num_graphs, K, K]
-        S_3d = S.view(num_graphs, K, K)
-
-        Q_src = Q[src]  # [E, K]
-        Q_dst = Q[dst]  # [E, K]
-        g_src = batch[src]  # [E] which graph each edge belongs to
-
-        # M_ij = Q_src[e] @ S[g] @ Q_dst[e]^T
-        S_for_edges = S_3d[g_src]  # [E, K, K]
-        # (Q_src @ S) -> [E, K], then dot with Q_dst
-        QS = torch.bmm(Q_src.unsqueeze(1), S_for_edges).squeeze(1)  # [E, K]
-        M = (QS * Q_dst).sum(dim=1)  # [E]
-
-        return M
 
     def importance_alignment_loss(self, batch: torch.Tensor,
                                   labels: torch.Tensor,

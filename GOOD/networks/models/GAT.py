@@ -153,18 +153,16 @@ class GATEncoder(BasicEncoder):
         self.site_calibration = None
         self._calib_info = None
 
-        # GBCR: inserted after calibration, before layer 2
+        # GBCR: inserted after calibration, before layer 2.
         num_balls = getattr(config.model, 'num_balls', 14)
         alpha_node = getattr(config.model, 'gbcr_alpha_node', 0.15)
-        alpha_edge = getattr(config.model, 'gbcr_alpha_edge', 0.25)
         self.gbcr = GBCR(
             feat_dim=config.model.dim_hidden,
             num_balls=num_balls,
             alpha_node=alpha_node,
-            alpha_edge=alpha_edge,
         )
 
-        # Layer 2+: standard GATConv (edge importance applied as edge_weight)
+        # Layer 2+: standard GATConv on the node-reweighted features.
         self.convs = nn.ModuleList(
             [
                 gnn.GATConv(config.model.dim_hidden * heads, config.model.dim_hidden,
@@ -205,11 +203,11 @@ class GATEncoder(BasicEncoder):
             self._calib_info = None
             self._h_calibrated = None
 
-        # GBCR: granular-ball cross-reweight (after calibration)
-        post_conv, edge_importance, gbcr_info = self.gbcr(post_conv, edge_index, batch)
-        # Store GBCR info for loss computation (accessible from model)
+        # GBCR: granular-ball cross-reweight (after calibration). Returns
+        # node-reweighted H and a dict of {Q, r, ball_batch} for downstream
+        # losses. The edge-importance branch has been removed (see gbcr.py).
+        post_conv, gbcr_info = self.gbcr(post_conv, edge_index, batch)
         self._gbcr_info = gbcr_info
-        self._gbcr_edge_importance = edge_importance
 
         # Layer 2+: standard GATConv with original edge_weight
         # GBCR node reweighting already modifies representations;

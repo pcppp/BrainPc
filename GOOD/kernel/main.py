@@ -56,7 +56,28 @@ def initialize_model_dataset(config: Union[CommonArgs, Munch], fold: int = 0) ->
         raise  # 重新抛出异常
 
 
-def compute_10fold_metrics(ckpts):
+def _detect_num_folds(config):
+    """Return the number of CV folds for the configured protocol.
+
+    LOSO: number of unique sites in the dataset's meta.json.
+    10fold (legacy): 10.
+    """
+    protocol = str(getattr(config.dataset, 'protocol', 'loso')).lower()
+    if protocol != 'loso':
+        return 10
+
+    import json
+    name = config.dataset.dataset_name
+    meta_paths = {
+        'GOODABIDE': './GOOD/data/good_datasets/abide_full_ood_schaefer100/meta.json',
+    }
+    if name not in meta_paths:
+        raise NotImplementedError(f'LOSO num_folds detection not configured for {name}')
+    meta = json.load(open(meta_paths[name]))
+    return len(set(meta['idx2site']))
+
+
+def compute_cv_metrics(ckpts):
     train_scores = []
     id_val_scores = []
     id_test_scores = []
@@ -107,7 +128,7 @@ def compute_10fold_metrics(ckpts):
     return results
 
 
-def compute_mixed_10fold_metrics(ckpts, id_ckpts):
+def compute_mixed_cv_metrics(ckpts, id_ckpts):
     val_scores = []
     test_scores = []
     test_precision = []
@@ -151,10 +172,18 @@ def compute_mixed_10fold_metrics(ckpts, id_ckpts):
     }
     return results
 
-def run_10fold_once(config):
+def run_cv_once(config):
+    """Run S-fold cross-validation.
+
+    Default protocol is LOSO (one held-out site per fold) -> S = num_sites.
+    Set config.dataset.protocol = '10fold' for the legacy cached split.
+    """
     id_ckpts, ckpts = [], []
-    for i in range(10):
-        print(f'\nFold {i + 1}')
+    num_folds = _detect_num_folds(config)
+    protocol = str(getattr(config.dataset, 'protocol', 'loso')).lower()
+    print(f'#IN# Cross-validation protocol: {protocol.upper()}  ({num_folds} folds)')
+    for i in range(num_folds):
+        print(f'\nFold {i + 1} / {num_folds}')
         process_configs(config, i)
 
         config.task = 'train'
@@ -208,9 +237,9 @@ def run_10fold_once(config):
             id_ckpts.append(id_ckpt)
             ckpts.append(ckpt)
 
-    id_ckpt_results = compute_10fold_metrics(id_ckpts)
-    ckpt_results = compute_10fold_metrics(ckpts)
-    mixed_results = compute_mixed_10fold_metrics(ckpts, id_ckpts)
+    id_ckpt_results = compute_cv_metrics(id_ckpts)
+    ckpt_results = compute_cv_metrics(ckpts)
+    mixed_results = compute_mixed_cv_metrics(ckpts, id_ckpts)
 
     # 保留你原来的打印（可选）
     print('#IN#\n\nID-ckpt results:')
@@ -272,7 +301,7 @@ def main():
         config.train.max_epoch = int(epoch)
         config.train.lr = float(lr)
         print(f"\n=== Run with λ1={l1}, λ2={l2}, λ3={l3} epoch_list ={epoch} lr_list = {lr} === ")
-        id_res, ood_res, mix_res = run_10fold_once(config)
+        id_res, ood_res, mix_res = run_cv_once(config)
 
         row_data = {
             "Parameter Combination": f"λ1={l1}, λ2={l2}, λ3={l3},epoch={epoch},lr={lr}",

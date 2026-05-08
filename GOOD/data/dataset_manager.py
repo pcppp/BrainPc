@@ -43,11 +43,13 @@ def load_dataset(name: str, config: Union[CommonArgs, Munch], fold: int = 0) -> 
     try:
         reset_random_seed(config)
 
+        protocol = getattr(config.dataset, 'protocol', 'loso')
         dataset, meta_info = register.datasets[name].load(dataset_root=config.dataset.dataset_root,
                                                           domain=config.dataset.domain,
                                                           shift=config.dataset.shift_type,
                                                           generate=config.dataset.generate,
-                                                          fold=fold)
+                                                          fold=fold,
+                                                          protocol=protocol)
     except KeyError as e:
         print('Dataset not found.')
         raise e

@@ -90,11 +90,11 @@ class Pipeline:
             return cls_loss, spec, data
 
         epoch = self.config.train.epoch
-        site_adv_warmup = getattr(self.config.train, 'gate_warmup_epoch', 8)
-        site_adv_stop = getattr(self.config.train, 'site_adv_stop_epoch', 20)
-        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 18)
-        gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
-        gate_reg_warmup = getattr(self.config.train, 'gate_reg_warmup', 8)
+        site_adv_warmup = self._stage_epoch('gate_warmup_epoch', 0.23)
+        site_adv_stop = self._stage_epoch('site_adv_stop_epoch', 0.57)
+        gbcr_warmup = self._stage_epoch('gbcr_warmup_epoch', 0.51)
+        gbcr_stop = self._stage_epoch('gbcr_stop_epoch', 0.71)
+        gate_reg_warmup = self._stage_epoch('gate_reg_warmup', 0.23)
 
         # --- Stage 1: gate-range / affine / gate-alignment regularization ---
         calib_info = self.model.calib_info if hasattr(self.model, 'calib_info') else None
@@ -164,8 +164,8 @@ class Pipeline:
     def _apply_post_step_freezes(self):
         r"""Stage-aware parameter freezing applied AFTER each optimizer step."""
         epoch = self.config.train.epoch
-        gbcr_warmup = getattr(self.config.train, 'gbcr_warmup_epoch', 18)
-        gbcr_stop = getattr(self.config.train, 'gbcr_stop_epoch', 25)
+        gbcr_warmup = self._stage_epoch('gbcr_warmup_epoch', 0.51)
+        gbcr_stop = self._stage_epoch('gbcr_stop_epoch', 0.71)
 
         if epoch >= gbcr_warmup:
             for p in self.model.site_calibration.parameters():
@@ -175,6 +175,26 @@ class Pipeline:
                 and hasattr(self.model.gnn.encoder, 'gbcr')):
             for p in self.model.gnn.encoder.gbcr.parameters():
                 p.requires_grad = False
+
+    def _stage_epoch(self, name: str, default_frac: float) -> int:
+        r"""Resolve a stage threshold to an absolute epoch.
+
+        If `config.train.{name}` is set explicitly (legacy absolute value),
+        return that. Otherwise scale default_frac * max_epoch so the
+        stage layout follows the configured schedule length. Fractions
+        below match the historical `max_epoch=35` layout:
+            gate_reg_warmup       : 0.23 (epoch 8)
+            gate_warmup_epoch     : 0.23 (epoch 8 — was 10 in legacy YAML)
+            site_adv_stop_epoch   : 0.57 (epoch 20)
+            gbcr_warmup_epoch     : 0.51 (epoch 18)
+            gbcr_stop_epoch       : 0.71 (epoch 25)
+            early_stop_start_epoch: 0.71 (epoch 25)
+            ckpt_min_epoch        : 0.29 (epoch 10)
+        """
+        abs_val = getattr(self.config.train, name, None)
+        if abs_val is not None:
+            return int(abs_val)
+        return int(round(self.config.train.max_epoch * default_frac))
 
     def train_batch(self, data: Batch, pbar) -> dict:
         r"""Standard single-batch training step.
@@ -196,67 +216,94 @@ class Pipeline:
                        lambda_meta: float, meta_test_aux: bool, rng) -> dict:
         r"""One episodic meta-learning step (MLDG-style first-order).
 
-        1. Pick one source site as meta_test_site, the rest as
-           meta_train_sites. Only training source sites are sampled —
-           real OOD test sites are not part of site_loaders so they
-           cannot leak in.
-        2. For each meta-train site: pull a batch, forward, compute the
-           full loss (cls + all stage-aware aux losses), and accumulate.
-        3. For the meta-test site: pull a batch, forward, compute either
-           cls-only (default) or full loss depending on meta_test_aux.
-        4. loss_total = mean(meta_train) + λ_meta * meta_test.
-        5. Backward + clip + optimizer step + post-step parameter freezes.
+        1. Sample one source site as meta_test_site; the remaining K-1
+           source sites form the meta-train pool. Real OOD test/val
+           sites are NOT in site_loaders so they cannot leak in.
+        2. Pull a small batch from each meta-train site and concatenate
+           into a single mixed-site batch (total ≈ train_bs). Run one
+           forward + one backward. The pooled batch keeps site_adv,
+           gate-alignment EMA and GBCR cross-site alignment alive.
+        3. Pull a batch from meta_test_site (single-site). Run a second
+           forward + backward; loss is scaled by lambda_meta and added
+           into .grad. site_adv is disabled here because the batch
+           contains only one site.
+        4. clip_grad_norm + optimizer.step + stage-aware parameter
+           freezes.
 
         First-order only — no model cloning, no second-order grad.
+        Net gradient = grad(meta_train_loss + lambda_meta * meta_test_loss).
         """
         from .episodic_meta import sample_episode, next_site_batch
 
         meta_train_sites, meta_test_site = sample_episode(source_sites, rng)
 
+        # ----- Pooled meta-train batch ----------------------------------
+        # Earlier revisions ran one forward per meta-train site (K-1
+        # forwards per step). That destroyed every cross-site signal
+        # inside the loss: site_adv was disabled, gate-align EMA only saw
+        # one site per step, GBCR cross-site alignment had no signal, and
+        # the K-1 single-site gradients averaged toward a near-zero
+        # direction (loss plateaued at ~0.3 for both meta-train and
+        # meta-test). The fix: pull a SMALL batch from each meta-train
+        # site (sized so the union ~= train_bs), concatenate into one
+        # mixed-site batch, and run a single forward + backward. This
+        # makes the meta-train forward look exactly like a standard
+        # source-mixed batch with the held-out site removed — which is
+        # what MLDG / DG-with-validation actually wants.
+        # ----------------------------------------------------------------
+        from torch_geometric.data import Batch as _PygBatch
+
         self.ood_algorithm.optimizer.zero_grad()
 
-        loss_meta_train = None
-        spec_acc = {'Align': 0.0, 'Entropy': 0.0, 'SiteAdv': 0.0, 'GateAlign': 0.0}
-        n_meta_train = 0
+        meta_train_data_list = []
         for site in meta_train_sites:
-            batch = next_site_batch(site_iterators, site_loaders, site)
-            if batch is None:
+            site_batch = next_site_batch(site_iterators, site_loaders, site)
+            if site_batch is None:
                 continue
-            l_train, spec, _ = self._compute_total_loss(batch, allow_aux=True, enable_site_adv=False)
-            loss_meta_train = l_train if loss_meta_train is None else loss_meta_train + l_train
-            for k in spec_acc:
-                spec_acc[k] += spec[k]
-            n_meta_train += 1
+            meta_train_data_list.extend(site_batch.to_data_list())
 
-        if n_meta_train == 0:
-            # Degenerate: no usable meta-train batch — fall back to a normal step.
+        if not meta_train_data_list:
+            # Degenerate: no usable meta-train sample at all.
             return self.train_batch(next_site_batch(site_iterators, site_loaders, meta_test_site), None)
-        loss_meta_train = loss_meta_train / float(n_meta_train)
-        for k in spec_acc:
-            spec_acc[k] /= float(n_meta_train)
 
+        meta_train_batch = _PygBatch.from_data_list(meta_train_data_list)
+        l_train, spec_train, _ = self._compute_total_loss(
+            meta_train_batch, allow_aux=True, enable_site_adv=True)
+        l_train.backward()
+        loss_meta_train_value = float(l_train.detach().item())
+        del l_train, meta_train_batch, meta_train_data_list
+
+        # ----- Meta-test single-site batch ------------------------------
         batch_test = next_site_batch(site_iterators, site_loaders, meta_test_site)
-        loss_meta_test, spec_test, _ = self._compute_total_loss(batch_test, allow_aux=meta_test_aux, enable_site_adv=False)
+        loss_meta_test, spec_test, _ = self._compute_total_loss(
+            batch_test, allow_aux=meta_test_aux, enable_site_adv=False)
+        (lambda_meta * loss_meta_test).backward()
+        loss_meta_test_value = float(loss_meta_test.detach().item())
+        del loss_meta_test
 
-        loss_total = loss_meta_train + lambda_meta * loss_meta_test
-        loss_total.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
         self._apply_post_step_freezes()
 
-        spec_log = dict(spec_acc)
-        for k in spec_log:
-            spec_log[k] = (spec_log[k] + spec_test.get(k, 0.0)) / 2.0
-        spec_log['MetaTrain'] = float(loss_meta_train.detach().item())
-        spec_log['MetaTest'] = float(loss_meta_test.detach().item())
+        loss_total_value = loss_meta_train_value + lambda_meta * loss_meta_test_value
+
+        # Spec losses: meta-train was a single multi-site forward, so
+        # spec_train is already aggregated across sites. Just blend with
+        # spec_test for an at-a-glance epoch summary.
+        spec_log = {
+            k: (spec_train.get(k, 0.0) + spec_test.get(k, 0.0)) / 2.0
+            for k in ('Align', 'Entropy', 'SiteAdv', 'GateAlign')
+        }
+        spec_log['MetaTrain'] = loss_meta_train_value
+        spec_log['MetaTest'] = loss_meta_test_value
         self.ood_algorithm.spec_loss = spec_log
         # Mirror mean_loss so existing per-epoch averaging logic still runs.
-        self.ood_algorithm.mean_loss = loss_total.detach()
+        self.ood_algorithm.mean_loss = torch.tensor(loss_total_value, device=self.config.device)
 
         return {
-            'loss': loss_total.detach(),
-            'loss_meta_train': float(loss_meta_train.detach().item()),
-            'loss_meta_test': float(loss_meta_test.detach().item()),
+            'loss': torch.tensor(loss_total_value, device=self.config.device),
+            'loss_meta_train': loss_meta_train_value,
+            'loss_meta_test': loss_meta_test_value,
             'meta_test_site': int(meta_test_site),
             'meta_train_sites': [int(s) for s in meta_train_sites],
         }
@@ -315,11 +362,17 @@ class Pipeline:
             else:
                 meta_rng = __import__("random").Random(int(getattr(self.config, 'random_seed', 0)))
                 site_iterators = {s: iter(site_loaders[s]) for s in source_sites}
-                # Match the standard training-step budget per epoch.
+                # Each pooled meta-train batch is ~ (S-2)/(S-1) the size of a
+                # standard-mode batch (per-site bs is train_bs // num_sources, so
+                # K-1 sites pool ~ (S-2)/(S-1) * train_bs graphs). Compensate by
+                # running 1.5x as many steps per epoch by default so total
+                # graph-forwards roughly match standard-mode coverage.
                 try:
-                    steps_per_epoch_meta = max(1, len(self.loader['train']))
+                    base_steps = max(1, len(self.loader['train']))
                 except TypeError:
-                    steps_per_epoch_meta = 1
+                    base_steps = 1
+                steps_mult = float(getattr(self.config.ood, 'meta_steps_mult', 1.5))
+                steps_per_epoch_meta = max(1, int(round(base_steps * steps_mult)))
                 print(f'#IN# [Meta] use_episodic_meta=True  λ_meta={lambda_meta}  '
                       f'meta_test_aux={meta_test_aux}  steps/epoch={steps_per_epoch_meta}')
 
@@ -397,12 +450,12 @@ class Pipeline:
             ckpt_path = os.path.join(self.config.ckpt_dir, f'{epoch}.ckpt')
             torch.save(ckpt, ckpt_path)
             shutil.copy(ckpt_path, os.path.join(self.config.ckpt_dir, f'last{fold}.ckpt'))
-            ckpt_min_epoch = getattr(self.config.train, 'ckpt_min_epoch', 10)
+            ckpt_min_epoch = self._stage_epoch('ckpt_min_epoch', 0.29)
             if epoch >= ckpt_min_epoch:
                 all_epoch_ckpts.append((epoch, ma5, ckpt_path))
 
             # ----- Early stopping bookkeeping (decision printed below) -----
-            early_stop_start = getattr(self.config.train, 'early_stop_start_epoch', 25)
+            early_stop_start = self._stage_epoch('early_stop_start_epoch', 0.71)
             should_stop = False
             if epoch >= early_stop_start:
                 if ma5 > best_patience_score:

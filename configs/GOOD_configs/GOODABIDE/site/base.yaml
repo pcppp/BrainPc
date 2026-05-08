@@ -4,6 +4,10 @@ dataset:
   dataset_name: GOODABIDE
   domain: site
   num_classes: 2
+  # Cross-validation protocol:
+  #   loso   -> S-fold leave-one-site-out (default; ABIDE has S=15)
+  #   10fold -> legacy cached subject-level split (kept as fallback)
+  protocol: loso
 train:
   train_bs: 64
   val_bs: 64

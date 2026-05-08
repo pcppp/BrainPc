@@ -236,3 +236,277 @@ so the ckpts produced during `Pipeline.train()` carry the same fields as
 `val_score` (= `ood_val_score`) and the "Val / Test" columns in
 `logs/grid_results.xlsx` silently reported OOD-only numbers, not the
 ID+OOD mix the column header implied.
+
+
+## LOSO main evaluation protocol (meta-learning branch, 2026-05-07)
+
+Cross-validation switched from a fixed 10-fold subject split to
+**leave-one-site-out (LOSO)**: with S=15 unique sites in ABIDE, training
+runs S=15 folds, each holding out one full site as the truly unseen
+`OOD test` domain.
+
+### Per-fold structure
+
+For fold `f` (held-out test site `sites[f]`):
+
+| Split        | Source                                               | Sites                                  | Subjects (typical) |
+|--------------|------------------------------------------------------|----------------------------------------|--------------------|
+| `ood_test` | site `sites[f]`                                    | 1 site (truly held-out)                | 30 ~ 184          |
+| `ood_val`  | site `sites[(f+1) % S]`                            | 1 site (rotated, also held-out)        | 30 ~ 184          |
+| `train`    | remaining S-2 sites, 80% subjects per (site, label)  | 13 sites                               | ~650-790          |
+| `id_val`   | same S-2 sites, 10% subjects per (site, label)       | 13 sites                               | ~70-85            |
+| `id_test`  | same S-2 sites, 10% subjects per (site, label)       | 13 sites                               | ~70-85            |
+
+Stratification is per (site, label) so every source site and both classes
+appear in each of `train / id_val / id_test`. Splits are deterministic
+across runs (seeded random shuffle within each (site, label) bucket).
+
+### Why two held-out sites per fold
+
+- `ood_test` is what we report. It is *never* seen during training and
+  *never* used for early stopping or ckpt selection.
+- `ood_val` is rotated to a *second* held-out site. Using it for the
+  `S_t` score and early stopping ensures the ckpt selection signal is
+  itself OOD, so we don't quietly leak the test domain into model
+  selection.
+- Episodic meta-learning then has `S - 2 = 13` source sites to sample
+  meta-test from per step. Plenty of diversity.
+
+### Episodic meta-learning interaction
+
+`build_site_loaders` in `GOOD/kernel/pipelines/episodic_meta.py` groups
+`self.loader['train'].dataset` by `data.env_id`. After the LOSO change
+that dataset only contains the 13 source sites, so:
+
+- `source_sites` = 13 ABIDE sites (test/val are absent by construction)
+- Each episode samples 1 of those 13 as meta-test, the other 12 as
+  meta-train. Real OOD test/val sites cannot leak in.
+
+### Configuration
+
+```yaml
+dataset:
+  dataset_name: GOODABIDE
+  domain: site
+  protocol: loso       # default; set to '10fold' for the legacy split
+```
+
+```bash
+./scripts/run_brainood_auto_gpu.sh   # runs all 15 LOSO folds
+```
+
+### Code touched
+
+- `GOOD/data/good_datasets/good_abide.py`:
+  - new `_build_loso_splits(meta_json, seed)` builds the per-fold index
+    arrays (matches the cached `*.index` shape).
+  - `GOODABIDE.load(... protocol='loso', **kwargs)` dispatches to the LOSO
+    builder and writes `meta_info.protocol / num_folds / loso_sites`.
+- `GOOD/data/dataset_manager.py`: forwards
+  `config.dataset.protocol` to `load`.
+- `GOOD/kernel/main.py`:
+  - `_detect_num_folds(config)` peeks the dataset's `meta.json` and
+    returns `S` (LOSO) or 10 (legacy).
+  - `run_10fold_once` -> `run_cv_once`; loop bound is `num_folds`.
+  - `compute_10fold_metrics` -> `compute_cv_metrics` (logic unchanged,
+    just size-agnostic). Same for `compute_mixed_*`.
+- `configs/GOOD_configs/GOODABIDE/site/base.yaml`: adds
+  `dataset.protocol: loso`.
+
+### Backward compatibility
+
+Setting `dataset.protocol: 10fold` in the YAML restores the cached
+subject-level split + `run_cv_once` runs 10 folds. The cached
+`*.index` files are unchanged.
+
+
+## Episodic OOM fix: incremental backward (meta-learning branch, 2026-05-07)
+
+`_train_episode` originally accumulated K = S - 1 meta-train loss tensors
+into one Python expression and ran a single backward at the end:
+
+```python
+loss_meta_train = sum(l_train for site in meta_train_sites)        # K graphs alive
+loss_total = loss_meta_train / K + lambda_meta * loss_meta_test
+loss_total.backward()
+```
+
+This kept K forward graphs simultaneously resident in autograd, peaking at
+~K × per-step memory. On a 24 GB card with ABIDE LOSO (K = 12 source
+sites in the meta-train pool), the GBCR `bmm` step reliably OOMed.
+
+The fix is mathematically equivalent: backward each meta-train loss
+immediately, scaled by 1/K, then backward the meta-test loss scaled by
+`lambda_meta`. `.grad` accumulates between calls because we only
+`zero_grad()` once at the start of the step:
+
+```python
+self.ood_algorithm.optimizer.zero_grad()
+for site in meta_train_sites:
+    l_train, ... = self._compute_total_loss(batch, ...)
+    (l_train / n).backward()      # autograd graph released here
+    del l_train
+loss_meta_test, ... = self._compute_total_loss(batch_test, ...)
+(lambda_meta * loss_meta_test).backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer.step()
+```
+
+Net gradient is identical to the original aggregation:
+`grad(mean(meta_train) + λ · meta_test)`. Peak activation memory drops
+to roughly that of a single standard-mode step.
+
+
+## Pooled meta-train batch (meta-learning branch, 2026-05-07 cont.)
+
+The earlier per-site episodic implementation ran K-1 forwards per step
+(one per meta-train site) and disabled `site_adv` because each
+single-site batch made the cross-entropy on a constant site label
+degenerate. That solved the OOM but **broke every cross-site signal**:
+
+- `site_adv`: disabled outright.
+- `gate_alignment_loss`: EMA only saw one (class, site) pair per step.
+- `GBCR.importance_alignment_loss`: needs >= 2 sites per batch.
+- The K-1 single-site gradients averaged toward a near-zero direction.
+
+Symptom: `meta_train` and `meta_test` losses both plateau around 0.3
+(roughly the easy-class CE floor) and the model stops improving.
+
+### Fix: pool meta-train into a single mixed batch
+
+`build_site_loaders` now sizes each per-site `DataLoader` to
+`max(1, train_bs // num_source_sites)` (≈ 4-5 graphs per site for ABIDE
+LOSO with 13 source sites and `train_bs=64`).
+
+`Pipeline._train_episode` then:
+
+```python
+# meta-train: pool one small batch from each of the K-1 sites into
+# one mixed-site batch (≈ train_bs total graphs).
+pool = []
+for site in meta_train_sites:
+    pool.extend(next_site_batch(...).to_data_list())
+mixed = Batch.from_data_list(pool)
+l_train, ... = self._compute_total_loss(mixed, allow_aux=True, enable_site_adv=True)
+l_train.backward()
+
+# meta-test: single-site batch as before, site_adv off (degenerate).
+batch_test = next_site_batch(...)
+l_test, ... = self._compute_total_loss(batch_test, allow_aux=meta_test_aux, enable_site_adv=False)
+(lambda_meta * l_test).backward()
+
+torch.nn.utils.clip_grad_norm_(...)
+optimizer.step()
+```
+
+### What this changes
+
+- **Per step**: 2 forwards (mixed meta-train + single meta-test) instead
+  of K-1 + 1. Wall-clock per step ≈ standard-mode + ε.
+- **Memory**: at most one forward graph live at a time (incremental
+  backward). Fits a 24 GB card with comfortable headroom.
+- **Cross-site signals restored**: meta-train batch contains all K-1
+  source sites, so site_adv / gate_align EMA / GBCR alignment all see
+  multi-site labels and produce real gradients.
+- **Loss formulation**:
+  `grad(loss_meta_train) + λ · grad(loss_meta_test)`,
+  matching the previous design but with `loss_meta_train` now a
+  per-graph mean over the mixed batch (standard ERM-on-source style)
+  instead of a per-site mean — which is the convention used in MLDG
+  / DG-with-validation literature.
+
+
+## Accuracy-impact fixes batch (meta-learning branch, 2026-05-07 cont.)
+
+Six fixes applied after the LOSO + pooled-meta-train integration. All
+on this branch only.
+
+### A1. PCA fits per fold on training subjects only
+
+`GOOD/data/good_datasets/good_abide.py`: `fit_pca_on_all` →
+`fit_pca_on_train`. The original behaviour fit PCA on **all** 1025
+subjects (including OOD val + OOD test) before per-fold split, leaking
+the OOD sites\' connectivity covariance into the principal-component
+basis. The leak was unsupervised (no labels) but under LOSO the OOD
+test site is a non-trivial fraction of the covariance estimator and
+biases OOD scores upward.
+
+Now: each fold first builds its index splits, then fits a fresh PCA
+basis on `G_dataset[ all_idx[\'train\'][fold] ]` only. Verified that
+fold 0 and fold 7 produce different bases (basis L2 ≈ 4.85).
+
+### A3. `weight_decay` 1e-3 → 1e-4
+
+`configs/.../BrainOOD.yaml`. AdamW already uses decoupled weight
+decay; `1e-3` was over-regularising the small SiteCalibration
+meta-network and the classifier head, suppressing gate / γ / β learning.
+
+### B2. SiteCalibration v3 strength restored
+
+`GOOD/networks/models/GDGMT.py`: `alpha` 0.1 → 0.25,
+`scale_bound` 0.1 → 0.2. The 0.1/0.1 fallback was a safety margin
+during the era when gate/affine reg was applied twice (C2 bug, since
+fixed). With C2 corrected, the v3 design values are safe to restore
+and let the meta-network produce up to ~5% feature modulation when the
+gate is fully open.
+
+YAML knobs: `model.calib_alpha`, `model.calib_scale_bound`.
+
+### B1. Stage thresholds relative to `max_epoch`
+
+`Pipeline._stage_epoch(name, default_frac)` resolves staged training
+boundaries to `round(max_epoch * default_frac)` unless the YAML
+provides an absolute integer override. Defaults reproduce the original
+`max_epoch=35` layout (8/8/20/18/25/25/10), but now scaling
+`max_epoch` correctly stretches every stage:
+
+| stage                 | frac | @35 | @50 |
+|-----------------------|------|-----|-----|
+| gate_reg_warmup       | 0.23 |  8  | 12  |
+| gate_warmup_epoch     | 0.23 |  8  | 12  |
+| site_adv_stop_epoch   | 0.57 | 20  | 28  |
+| gbcr_warmup_epoch     | 0.51 | 18  | 26  |
+| gbcr_stop_epoch       | 0.71 | 25  | 36  |
+| early_stop_start_epoch| 0.71 | 25  | 36  |
+| ckpt_min_epoch        | 0.29 | 10  | 14  |
+
+Legacy YAML keys `gate_warmup_epoch: 10` and
+`contrastive_warmup_epoch: 20` removed from the BrainOOD config
+(the latter was already dead).
+
+### A2. GBCR `edge_importance` deleted
+
+`GOOD/networks/models/gbcr.py` + `GOOD/networks/models/GAT.py`.
+`W_s` (bilinear ball-edge weight), `_compute_ball_edge_importance`,
+`_compute_edge_importance` and the `alpha_edge` knob are removed.
+GBCR\.forward now returns `(H_reweighted, gbcr_info)` (2-tuple
+instead of 3-tuple); GAT2 already only used the original `edge_weight`,
+so this branch was pure dead compute. The `bmm` over `[E, K, K]` in
+`_compute_edge_importance` was the OOM-trigger in episodic mode.
+
+### B4. Pooled meta-train steps per epoch
+
+`Pipeline.train()`:
+`steps_per_epoch_meta = round(meta_steps_mult * len(train_loader))`
+with `meta_steps_mult` defaulting to **1.5** (configurable via
+`config.ood.meta_steps_mult`). Pooled meta-train batches are
+~`(S-2)/(S-1)` the size of standard-mode batches, so 1.5x as many
+steps roughly preserves the per-epoch graph-forward count.
+
+### Combined behaviour change for the next run
+
+Compared to the previous `meta-learning` branch tip:
+
+- PCA basis now changes each fold (no OOD leak).
+- `weight_decay` is 10x lighter — gate / γ / β should move noticeably more.
+- SiteCalibration\'s effective output range is 2.5x larger.
+- GBCR window auto-scales when `max_epoch` is changed.
+- One forward graph less per step (no edge_importance bmm).
+- ~12 → ~18 steps per epoch in episodic mode.
+
+Expected first-fold signs of correctness within ~5 epochs:
+
+- `Train | total` drops below 0.5
+- `Gate | mean` drifts into the 0.05–0.15 target band
+- `SiteProbe | Δ` ≥ 0.05 (post-gate site classifier accuracy drops)
+- `OOD_val | BA` notably above 0.5

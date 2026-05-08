@@ -127,7 +127,7 @@ class GOODABIDE(InMemoryDataset):
 
 
     @staticmethod
-    def load(dataset_root: str, domain: str="site", shift: str = 'no_shift', generate: bool = False, fold: int = 0):
+    def load(dataset_root: str, domain: str="site", shift: str = 'no_shift', generate: bool = False, fold: int = 0, protocol: str = "loso", **kwargs):
         r"""
         A staticmethod for dataset loading. This method instantiates dataset class, constructing train, id_val, id_test,
         ood_val (val), and ood_test (test) splits. Besides, it collects several dataset meta information for further
@@ -207,9 +207,31 @@ class GOODABIDE(InMemoryDataset):
                 else:
                     G_dataset[i].ndata['feat'] = G_dataset[i].ndata['N_features'].clone()
 
-        all_idx = get_all_split_idx(meta_info.name)
-        # Fit PCA on all subjects (unsupervised) before converting to PyG
-        fit_pca_on_all(G_dataset)
+        # --- Build train/id_val/id_test/ood_val/ood_test indices ---
+        # "loso":  S-fold leave-one-site-out (held-out site = OOD test, second
+        #          site = OOD val, remaining S-2 sites split 80/10/10).
+        # "10fold": legacy cached *.index files at the GOOD dataset dir.
+        if str(protocol).lower() == 'loso':
+            seed_for_split = 0  # deterministic across runs; only the within-site
+                                # subject shuffle uses it
+            all_idx, num_loso_folds, loso_sites = _build_loso_splits(meta_json, seed=seed_for_split)
+            meta_info.protocol = 'loso'
+            meta_info.num_folds = num_loso_folds
+            meta_info.loso_sites = loso_sites
+            print(f'#IN# LOSO protocol: {num_loso_folds} folds over sites {loso_sites}; '
+                  f'fold {fold} -> ood_test_site={loso_sites[fold]}, '
+                  f'ood_val_site={loso_sites[(fold + 1) % num_loso_folds]}')
+        else:
+            all_idx = get_all_split_idx(meta_info.name)
+            meta_info.protocol = '10fold'
+            meta_info.num_folds = 10
+        # Fit PCA only on the training subjects of THIS fold.  Fitting on the
+        # full dataset (legacy behaviour) leaks the OOD test/val site's
+        # connectivity covariance into the principal-component basis, even
+        # though the PCA itself is unsupervised.  Under LOSO that leak biases
+        # OOD scores upward by 1-3 points.
+        train_idx_for_pca = list(all_idx['train'][fold])
+        fit_pca_on_train([G_dataset[i] for i in train_idx_for_pca])
         train_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['train'][fold]]
         id_val_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['id_val'][fold]]
         id_test_data = [dgl_to_pyg(G_dataset[idx], Labels['glabel'][idx],meta_json[f'idx2{domain}'][idx]) for idx in all_idx['id_test'][fold]]
@@ -256,6 +278,77 @@ class GOODABIDE(InMemoryDataset):
         return {'train': train_dataset, 'id_val': id_val_dataset, 'id_test': id_test_dataset,
                 'val': val_dataset, 'test': test_dataset, 'task': train_dataset.task,
                 'metric': train_dataset.metric}, meta_info
+
+
+def _build_loso_splits(meta_json, seed: int = 0):
+    """Leave-One-Site-Out splits.
+
+    Returns all_idx in the same shape as the cached *.index files
+    (dict of split-name -> list of folds, each fold = list of subject
+    indices into the global G_dataset).
+
+    For each fold f (0 <= f < S):
+      * ood_test[f]: every subject from site sites[f] -- the truly
+        unseen test domain. Never appears in train.
+      * ood_val[f]:  every subject from site sites[(f+1) % S] -- a
+        second held-out site, used for early stopping / S_t scoring so the
+        ckpt selection signal is itself OOD (not source-leaked).
+      * train, id_val, id_test: 80/10/10 stratified split over
+        subjects of the remaining S-2 source sites, stratified per
+        (site, label) so every source site and both classes appear in
+        each split.
+    """
+    import random
+    from collections import defaultdict
+
+    site_ids = list(meta_json['idx2site'])
+    labels = list(meta_json['idx2label'])
+    n = len(site_ids)
+    assert len(labels) == n, 'meta.json idx2label / idx2site length mismatch'
+
+    # Sorted unique site ids -> deterministic fold ordering across runs.
+    sites = sorted(set(site_ids))
+    S = len(sites)
+    assert S >= 3, f'LOSO needs >=3 sites for train/val/test partitioning; got {S}'
+
+    rng = random.Random(int(seed))
+
+    splits = {'train': [], 'id_val': [], 'id_test': [],
+              'ood_val': [], 'ood_test': []}
+
+    for f, test_site in enumerate(sites):
+        val_site = sites[(f + 1) % S]
+
+        ood_test_idx = [i for i in range(n) if site_ids[i] == test_site]
+        ood_val_idx = [i for i in range(n) if site_ids[i] == val_site]
+
+        # Group remaining (source) subjects by (site, label) for stratified split.
+        groups = defaultdict(list)
+        for i in range(n):
+            if site_ids[i] in (test_site, val_site):
+                continue
+            groups[(site_ids[i], labels[i])].append(i)
+
+        train_idx, id_val_idx, id_test_idx = [], [], []
+        for key, indices in groups.items():
+            rng.shuffle(indices)
+            n_total = len(indices)
+            # 10% to id_val and 10% to id_test (each at least 1 if the bucket
+            # has >= 2 subjects, else give id_val priority).
+            n_id_val = max(1, n_total // 10) if n_total >= 2 else 0
+            remaining = n_total - n_id_val
+            n_id_test = max(1, remaining // 9) if remaining >= 2 else 0
+            id_val_idx.extend(indices[:n_id_val])
+            id_test_idx.extend(indices[n_id_val:n_id_val + n_id_test])
+            train_idx.extend(indices[n_id_val + n_id_test:])
+
+        splits['train'].append(train_idx)
+        splits['id_val'].append(id_val_idx)
+        splits['id_test'].append(id_test_idx)
+        splits['ood_val'].append(ood_val_idx)
+        splits['ood_test'].append(ood_test_idx)
+
+    return splits, S, sites
 
 
 def get_all_split_idx(name):
@@ -306,27 +399,37 @@ _pca_mean = None
 _PCA_DIM = 32
 
 
-def fit_pca_on_all(G_dataset):
-    """Fit PCA on FC features of all subjects (unsupervised, no label leakage)."""
+def fit_pca_on_train(G_dataset_train):
+    """Fit the global PCA basis on the *training* subjects of one fold.
+
+    Replaces the original 'fit on all subjects' behaviour which silently
+    leaked OOD test/val site connectivity into the PCA basis. Called once
+    per fold, refits the module-level globals _pca_components and
+    _pca_mean. PCA is unsupervised but training-fold-restricted now.
+    """
     global _pca_components, _pca_mean
     import numpy as np
-    
+
     all_fc = []
-    for g in G_dataset:
+    for g in G_dataset_train:
         fc = g.ndata['FC_features'].numpy()  # [100, 100]
         all_fc.append(fc)
-    
-    # Stack all FC rows: [N_subjects * 100, 100]
-    all_rows = np.concatenate(all_fc, axis=0)  # [102500, 100]
-    
-    # PCA via SVD
+
+    all_rows = np.concatenate(all_fc, axis=0)  # [N_train_subjects * 100, 100]
+
     _pca_mean = all_rows.mean(axis=0)
     centered = all_rows - _pca_mean
     U, S, Vt = np.linalg.svd(centered, full_matrices=False)
     _pca_components = Vt[:_PCA_DIM].T  # [100, 32]
-    
-    explained = (S[:_PCA_DIM]**2).sum() / (S**2).sum()
-    print(f'#IN#PCA fitted: {all_rows.shape[1]} -> {_PCA_DIM}, explained variance: {explained:.4f}')
+
+    explained = (S[:_PCA_DIM] ** 2).sum() / (S ** 2).sum()
+    print(f'#IN#PCA fitted on {len(G_dataset_train)} training subjects: '
+          f'{all_rows.shape[1]} -> {_PCA_DIM}, explained variance: {explained:.4f}')
+
+
+# Backward-compat shim (legacy callers, not used inside this branch).
+def fit_pca_on_all(G_dataset):
+    fit_pca_on_train(list(G_dataset))
 
 
 def _apply_pca(fc_rows):

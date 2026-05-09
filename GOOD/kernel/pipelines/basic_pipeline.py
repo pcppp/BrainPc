@@ -84,7 +84,29 @@ class Pipeline:
         cls_loss = self.ood_algorithm.loss_calculate(raw_pred, targets, mask, node_norm, self.config)
         cls_loss = self.ood_algorithm.loss_postprocess(cls_loss, data, mask, self.config)
 
-        spec = {'Align': 0.0, 'Entropy': 0.0, 'SiteAdv': 0.0, 'GateAlign': 0.0}
+        # Compute batch accuracy on the fly. CE alone is misleading when read
+        # as a 0..1 score (0.5 looks like random but corresponds to ~60% acc).
+        # Acc gives an immediate read on whether the model is learning.
+        with torch.no_grad():
+            if raw_pred.dim() == 2:
+                _preds = raw_pred.argmax(dim=1)
+            else:
+                _preds = (raw_pred > 0).long()
+            _t = targets.squeeze(-1) if targets.dim() > 1 and targets.shape[-1] == 1 else targets
+            _m = mask.squeeze(-1) if mask is not None and mask.dim() > 1 else mask
+            if _m is not None and _m.bool().sum() > 0:
+                _valid = _m.bool()
+                _acc = (_preds[_valid] == _t[_valid]).float().mean().item()
+            else:
+                _acc = float((_preds == _t).float().mean().item())
+
+        # Capture pure CE before aux terms get folded in. The aux terms
+        # (site_adv, gate_align, GBCR-align/entropy) turn on/off at stage
+        # boundaries → the total loss visibly jumps every few epochs even
+        # when CE is moving smoothly. spec['Cls'] gives a stable trajectory.
+        spec = {'Align': 0.0, 'Entropy': 0.0, 'SiteAdv': 0.0, 'GateAlign': 0.0,
+                'Cls': float(cls_loss.detach().item()),
+                'Acc': float(_acc)}
 
         if not allow_aux:
             return cls_loss, spec, data
@@ -212,74 +234,129 @@ class Pipeline:
         self.ood_algorithm.spec_loss = spec
         return {'loss': cls_loss.detach()}
 
-    def _train_episode(self, site_iterators, site_loaders, source_sites,
-                       lambda_meta: float, meta_test_aux: bool, rng) -> dict:
+    def _train_episode(self, site_iterators, site_loaders,
+                       meta_train_sites, meta_test_site,
+                       lambda_meta: float, meta_test_aux: bool) -> dict:
         r"""One episodic meta-learning step (MLDG-style first-order).
 
-        1. Sample one source site as meta_test_site; the remaining K-1
-           source sites form the meta-train pool. Real OOD test/val
-           sites are NOT in site_loaders so they cannot leak in.
-        2. Pull a small batch from each meta-train site and concatenate
-           into a single mixed-site batch (total ≈ train_bs). Run one
-           forward + one backward. The pooled batch keeps site_adv,
-           gate-alignment EMA and GBCR cross-site alignment alive.
-        3. Pull a batch from meta_test_site (single-site). Run a second
-           forward + backward; loss is scaled by lambda_meta and added
-           into .grad. site_adv is disabled here because the batch
-           contains only one site.
-        4. clip_grad_norm + optimizer.step + stage-aware parameter
-           freezes.
+        1. meta_train_sites and meta_test_site come from the caller
+           (round-robin queue in train()). Real OOD test/val sites are
+           NOT in site_loaders so they cannot leak in.
+        2. Pool a small batch from each meta-train site → mixed-site batch
+           (~= train_bs). One forward + one backward. site_adv etc are
+           live because the batch contains all K-1 source sites.
+        3. Pull a single-site batch from meta_test_site. One forward +
+           (λ * loss).backward(). site_adv is disabled (single-site
+           CE on a constant site label is degenerate).
+        4. clip_grad_norm + optimizer.step + stage-aware param freezes.
+
+        Decoupled meta-network update ("G"): during stages 1-2 (epoch <
+        gbcr_warmup) the SiteCalibration parameters are frozen for the
+        meta-train backward and only updated by the meta-test backward.
+        This pushes the meta-network toward a calibration rule that helps
+        on the rotating held-out source — i.e. the meta-learned, not
+        source-fitted, regime. Once epoch ≥ gbcr_warmup,
+        _apply_post_step_freezes permanently freezes the calibration
+        anyway so this gating becomes a no-op.
 
         First-order only — no model cloning, no second-order grad.
-        Net gradient = grad(meta_train_loss + lambda_meta * meta_test_loss).
+        Net gradient (over non-calibration params) =
+            grad(meta_train_loss) + lambda_meta * grad(meta_test_loss).
+        Net gradient (over calibration params, pre-stage-3) =
+            lambda_meta * grad(meta_test_loss).
         """
-        from .episodic_meta import sample_episode, next_site_batch
-
-        meta_train_sites, meta_test_site = sample_episode(source_sites, rng)
-
-        # ----- Pooled meta-train batch ----------------------------------
-        # Earlier revisions ran one forward per meta-train site (K-1
-        # forwards per step). That destroyed every cross-site signal
-        # inside the loss: site_adv was disabled, gate-align EMA only saw
-        # one site per step, GBCR cross-site alignment had no signal, and
-        # the K-1 single-site gradients averaged toward a near-zero
-        # direction (loss plateaued at ~0.3 for both meta-train and
-        # meta-test). The fix: pull a SMALL batch from each meta-train
-        # site (sized so the union ~= train_bs), concatenate into one
-        # mixed-site batch, and run a single forward + backward. This
-        # makes the meta-train forward look exactly like a standard
-        # source-mixed batch with the held-out site removed — which is
-        # what MLDG / DG-with-validation actually wants.
-        # ----------------------------------------------------------------
+        from .episodic_meta import next_site_batch
         from torch_geometric.data import Batch as _PygBatch
+
+        # ----- Identify SiteCalibration parameters (for G in stages 1-2) -----
+        epoch = self.config.train.epoch
+        gbcr_warmup_ep = self._stage_epoch('gbcr_warmup_epoch', 0.51)
+        apply_G = (epoch < gbcr_warmup_ep
+                   and hasattr(self.model, 'site_calibration'))
+        calib_param_ids = ({id(p) for p in self.model.site_calibration.parameters()}
+                           if apply_G else set())
 
         self.ood_algorithm.optimizer.zero_grad()
 
+        # ----- Pooled meta-train batch from K-1 sites -----
         meta_train_data_list = []
         for site in meta_train_sites:
             site_batch = next_site_batch(site_iterators, site_loaders, site)
             if site_batch is None:
                 continue
             meta_train_data_list.extend(site_batch.to_data_list())
-
         if not meta_train_data_list:
-            # Degenerate: no usable meta-train sample at all.
             return self.train_batch(next_site_batch(site_iterators, site_loaders, meta_test_site), None)
-
         meta_train_batch = _PygBatch.from_data_list(meta_train_data_list)
+
+        # ----- Compute g_train via autograd.grad (releases l_train graph) -----
         l_train, spec_train, _ = self._compute_total_loss(
             meta_train_batch, allow_aux=True, enable_site_adv=True)
-        l_train.backward()
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        g_train_raw = torch.autograd.grad(l_train, params, retain_graph=False, allow_unused=True)
+        g_train = [(g.detach() if g is not None else torch.zeros_like(p))
+                   for g, p in zip(g_train_raw, params)]
         loss_meta_train_value = float(l_train.detach().item())
-        del l_train, meta_train_batch, meta_train_data_list
+        del l_train, meta_train_batch, meta_train_data_list, g_train_raw
 
-        # ----- Meta-test single-site batch ------------------------------
+        # G: zero out calibration components of g_train.  Equivalent to
+        # "requires_grad=False on calibration during meta-train forward"
+        # but cleaner because we need uniform parameter list for cosine.
+        if apply_G:
+            for i, p in enumerate(params):
+                if id(p) in calib_param_ids:
+                    g_train[i] = torch.zeros_like(p)
+
+        # ----- Meta-test single-site batch + g_test -----
+        # NOTE: model uses LayerNorm everywhere (see BasicEncoder), so we do
+        # not need the BN-freeze trick that was here in earlier revisions.
+        # LayerNorm operates per-sample and has no running stats — single-site
+        # mini-batches do not pollute any global normalisation state.
         batch_test = next_site_batch(site_iterators, site_loaders, meta_test_site)
         loss_meta_test, spec_test, _ = self._compute_total_loss(
             batch_test, allow_aux=meta_test_aux, enable_site_adv=False)
-        (lambda_meta * loss_meta_test).backward()
+        g_test_raw = torch.autograd.grad(loss_meta_test, params, retain_graph=False, allow_unused=True)
+        g_test = [(g.detach() if g is not None else torch.zeros_like(p))
+                  for g, p in zip(g_test_raw, params)]
         loss_meta_test_value = float(loss_meta_test.detach().item())
-        del loss_meta_test
+        del loss_meta_test, g_test_raw
+
+        # ----- Step 2: cosine + PCGrad alignment -----
+        # Flatten gradients for cosine / projection. Done in fp32 to avoid
+        # precision loss on large parameter counts.
+        flat_train = torch.cat([g.flatten() for g in g_train])
+        flat_test = torch.cat([g.flatten() for g in g_test])
+        norm_train = flat_train.norm()
+        norm_test = flat_test.norm()
+        cos_sim = float((flat_train * flat_test).sum().item()
+                        / (norm_train.item() * norm_test.item() + 1e-8))
+
+        grad_align_mode = str(getattr(self.config.ood, 'grad_align', 'pcgrad')).lower()
+        align_warmup_ep = int(getattr(self.config.ood, 'grad_align_warmup_epoch',
+                                      self._stage_epoch('gate_warmup_epoch', 0.23)))
+        cos_after = cos_sim
+        # PCGrad: if conflict (cos < 0) and we are past warmup, project the
+        # meta-test gradient onto the orthogonal complement of g_train so
+        # the two gradients no longer pull in opposing directions.
+        if (grad_align_mode == 'pcgrad'
+                and cos_sim < 0.0
+                and epoch >= align_warmup_ep
+                and norm_train.item() > 1e-8):
+            proj_coeff = ((flat_train * flat_test).sum()
+                          / (flat_train * flat_train).sum().clamp(min=1e-12))
+            flat_test = flat_test - proj_coeff * flat_train
+            # Recompute g_test from corrected flat tensor
+            offset = 0
+            for i, g in enumerate(g_test):
+                n = g.numel()
+                g_test[i] = flat_test[offset:offset + n].view_as(g)
+                offset += n
+            cos_after = float((flat_train * flat_test).sum().item()
+                              / (norm_train.item() * flat_test.norm().item() + 1e-8))
+
+        # ----- Combine and write into .grad, then step -----
+        for p, gt, gtt in zip(params, g_train, g_test):
+            p.grad = gt + lambda_meta * gtt
 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.ood_algorithm.optimizer.step()
@@ -287,23 +364,30 @@ class Pipeline:
 
         loss_total_value = loss_meta_train_value + lambda_meta * loss_meta_test_value
 
-        # Spec losses: meta-train was a single multi-site forward, so
-        # spec_train is already aggregated across sites. Just blend with
-        # spec_test for an at-a-glance epoch summary.
+        # ----- Logging: cls vs total split + cosine alignment -----
         spec_log = {
             k: (spec_train.get(k, 0.0) + spec_test.get(k, 0.0)) / 2.0
             for k in ('Align', 'Entropy', 'SiteAdv', 'GateAlign')
         }
-        spec_log['MetaTrain'] = loss_meta_train_value
-        spec_log['MetaTest'] = loss_meta_test_value
+        spec_log['MetaTrain'] = float(spec_train.get('Cls', loss_meta_train_value))
+        spec_log['MetaTest'] = float(spec_test.get('Cls', loss_meta_test_value))
+        spec_log['MetaTrainAcc'] = float(spec_train.get('Acc', 0.0))
+        spec_log['MetaTestAcc'] = float(spec_test.get('Acc', 0.0))
+        spec_log['MetaTotalTrain'] = loss_meta_train_value
+        spec_log['MetaTotalTest'] = loss_meta_test_value
+        spec_log['CosBefore'] = cos_sim
+        spec_log['CosAfter'] = cos_after
         self.ood_algorithm.spec_loss = spec_log
-        # Mirror mean_loss so existing per-epoch averaging logic still runs.
         self.ood_algorithm.mean_loss = torch.tensor(loss_total_value, device=self.config.device)
 
         return {
             'loss': torch.tensor(loss_total_value, device=self.config.device),
-            'loss_meta_train': loss_meta_train_value,
-            'loss_meta_test': loss_meta_test_value,
+            'loss_meta_train': float(spec_train.get('Cls', loss_meta_train_value)),
+            'loss_meta_test': float(spec_test.get('Cls', loss_meta_test_value)),
+            'loss_meta_train_total': loss_meta_train_value,
+            'loss_meta_test_total': loss_meta_test_value,
+            'cos_before': cos_sim,
+            'cos_after': cos_after,
             'meta_test_site': int(meta_test_site),
             'meta_train_sites': [int(s) for s in meta_train_sites],
         }
@@ -343,7 +427,6 @@ class Pipeline:
         site_loaders = None
         site_iterators = None
         source_sites = None
-        meta_rng = None
         steps_per_epoch_meta = 0
         if use_episodic_meta:
             from .episodic_meta import build_site_loaders
@@ -360,7 +443,6 @@ class Pipeline:
                       f'falling back to standard training (need >={min_sites}).')
                 use_episodic_meta = False
             else:
-                meta_rng = __import__("random").Random(int(getattr(self.config, 'random_seed', 0)))
                 site_iterators = {s: iter(site_loaders[s]) for s in source_sites}
                 # Each pooled meta-train batch is ~ (S-2)/(S-1) the size of a
                 # standard-mode batch (per-site bs is train_bs // num_sources, so
@@ -387,14 +469,31 @@ class Pipeline:
             episode_log = None  # populated only in episodic mode
             if use_episodic_meta:
                 training_mode = 'episodic_meta_learning'
+                # ----- B: round-robin meta-test site queue ----------------
+                # Reshuffle the source-sites list every epoch with a
+                # fold/epoch-specific seed so site coverage is uniform AND
+                # different folds see different rotation orders.
+                _rr = __import__('random').Random(
+                    int(getattr(self.config, 'random_seed', 0))
+                    + int(epoch) * 1009 + int(fold) * 17)
+                meta_test_queue = list(source_sites)
+                _rr.shuffle(meta_test_queue)
+                queue_pos = 0
                 for index in range(steps_per_epoch_meta):
                     p = (index / steps_per_epoch_meta + epoch) / max_epochs
                     self.config.train.alpha = 2. / (1. + np.exp(-10 * p)) - 1
+                    if queue_pos >= len(meta_test_queue):
+                        _rr.shuffle(meta_test_queue)
+                        queue_pos = 0
+                    meta_test_site = meta_test_queue[queue_pos]
+                    queue_pos += 1
+                    meta_train_sites = [s for s in source_sites if s != meta_test_site]
                     ep_stat = self._train_episode(
-                        site_iterators, site_loaders, source_sites,
+                        site_iterators, site_loaders,
+                        meta_train_sites=meta_train_sites,
+                        meta_test_site=meta_test_site,
                         lambda_meta=lambda_meta,
                         meta_test_aux=meta_test_aux,
-                        rng=meta_rng,
                     )
                     episode_log = ep_stat
                     mean_loss = (mean_loss * index + float(ep_stat['loss'].item())) / (index + 1)

@@ -23,7 +23,7 @@ model:
   lstm_hidden_size: 128
   dim_hidden: 64
   dim_ffn: 64
-  dropout_rate: 0.3
+  dropout_rate: 0.2
   use_cnn: False
 dataset:
   dataloader_name: BaseDataLoader

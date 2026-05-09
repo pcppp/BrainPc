@@ -33,15 +33,26 @@ ood:
   # Pooled meta-train batches are smaller than standard-mode batches; 1.5x
   # default keeps total graph-forwards comparable to standard mode.
   meta_steps_mult: 1.5
+  # Step 2: gradient-conflict resolution.
+  #   'none'  — sum g_train + lambda * g_test (default; preserves MLDG semantics)
+  #   'pcgrad' — when cos(g_train, g_test) < 0, project g_test onto the
+  #              orthogonal complement of g_train. NOTE: this is conceptually
+  #              opposite to what MLDG wants. PCGrad zeroes meta-test's
+  #              ability to push back against source-overfit directions in
+  #              g_train — i.e. it lets source ERM \win\ every conflict.
+  #              Empirically tested 2026-05-08 on full LOSO and made fold 7
+  #              regress by 0.10 BA. Kept as a knob for ablation only.
+  grad_align: none
 train:
   max_epoch: 35
   lr: 1e-3
   weight_decay: 1e-4
   ball_r: 0.5
   gb_weight: 0.02
-  label_smoothing: 0.05
+  label_smoothing: 0.0
   patience: 8
-  classifier_dropout: 0.5
+  ckpt_min_epoch: 1   # let early-peak ckpts (e.g. epoch 2) enter NMS pool
+  classifier_dropout: 0.3
   # Staged training thresholds are now expressed as FRACTIONS of max_epoch
   # via Pipeline._stage_epoch() — see basic_pipeline.py for the defaults.
   # Override absolutes here only if you need a custom schedule, e.g.
